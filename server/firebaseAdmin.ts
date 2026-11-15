@@ -8,18 +8,30 @@ export interface FirebaseAdminServices {
   db: Firestore;
 }
 
+export function normalizePrivateKey(rawKey: string): string {
+  return rawKey
+    .trim()
+    .replace(/^['"]|['"]$/g, '')
+    .replace(/\\n/g, '\n')
+    .replace(/\r\n/g, '\n')
+    .trim();
+}
+
 export function getFirebaseAdminEnvStatus() {
+  const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim() || '';
   const projectId = process.env.FIREBASE_PROJECT_ID?.trim() || '';
   const clientEmail = process.env.FIREBASE_CLIENT_EMAIL?.trim() || '';
   const privateKeyRaw = process.env.FIREBASE_PRIVATE_KEY?.trim() || '';
   const databaseId = process.env.FIREBASE_DATABASE_ID?.trim() || '';
 
-  const configured = Boolean(projectId && clientEmail && privateKeyRaw);
+  const configured = Boolean(
+    serviceAccountJson || (projectId && clientEmail && privateKeyRaw)
+  );
   return {
     configured,
-    projectIdPresent: Boolean(projectId),
-    clientEmailPresent: Boolean(clientEmail),
-    privateKeyPresent: Boolean(privateKeyRaw),
+    projectIdPresent: Boolean(projectId || serviceAccountJson),
+    clientEmailPresent: Boolean(clientEmail || serviceAccountJson),
+    privateKeyPresent: Boolean(privateKeyRaw || serviceAccountJson),
     databaseId: databaseId || '(default)'
   };
 }
@@ -31,16 +43,32 @@ export function getFirebaseAdminServices(): FirebaseAdminServices {
     return cachedServices;
   }
 
-  const projectId = process.env.FIREBASE_PROJECT_ID?.trim();
-  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL?.trim();
+  let projectId = process.env.FIREBASE_PROJECT_ID?.trim();
+  let clientEmail = process.env.FIREBASE_CLIENT_EMAIL?.trim();
   const privateKeyRaw = process.env.FIREBASE_PRIVATE_KEY?.trim();
+  const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim();
   const databaseId = process.env.FIREBASE_DATABASE_ID?.trim();
 
-  if (!projectId || !clientEmail || !privateKeyRaw) {
-    throw new Error('FIREBASE_ADMIN_NOT_CONFIGURED');
+  let privateKey = privateKeyRaw ? normalizePrivateKey(privateKeyRaw) : '';
+
+  if ((!projectId || !clientEmail || !privateKey) && serviceAccountJson) {
+    try {
+      const parsed = JSON.parse(serviceAccountJson) as {
+        project_id?: string;
+        client_email?: string;
+        private_key?: string;
+      };
+      projectId = projectId || parsed.project_id?.trim();
+      clientEmail = clientEmail || parsed.client_email?.trim();
+      privateKey = privateKey || (parsed.private_key ? normalizePrivateKey(parsed.private_key) : '');
+    } catch {
+      throw new Error('FIREBASE_ADMIN_INVALID_JSON');
+    }
   }
 
-  const privateKey = privateKeyRaw.replace(/\\n/g, '\n');
+  if (!projectId || !clientEmail || !privateKey) {
+    throw new Error('FIREBASE_ADMIN_NOT_CONFIGURED');
+  }
 
   const app =
     getApps().length > 0

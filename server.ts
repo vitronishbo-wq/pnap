@@ -219,7 +219,23 @@ export function createApp(customDeps?: Partial<ServerDependencies>) {
       .catch(() => undefined);
   }
 
-  // --- ROTA PÚBLICA DE HEALTHCHECK (RENDER) ---
+  // --- ROTA RAIZ & HEALTHCHECK (RENDER) ---
+  app.get('/', (_req, res) => {
+    res.status(200).json({
+      status: 'ok',
+      service: 'pnap-backend-api',
+      rdpa: 'RDPA 2024 · 21 Províncias',
+      endpoints: {
+        health: '/health',
+        api: '/api/pnap'
+      }
+    });
+  });
+
+  app.get('/favicon.ico', (_req, res) => {
+    res.status(204).end();
+  });
+
   app.get('/health', (_req, res) => {
     const firebaseStatus = getFirebaseAdminEnvStatus();
     res.status(200).json({
