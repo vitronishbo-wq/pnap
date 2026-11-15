@@ -10,6 +10,7 @@ import { ProvinceId, Inmate, NationalInmateIndexItem } from './types/pnap';
 import { MOCK_USERS, INMATES_LOCAL_DB } from './data/mockPnapData';
 import { pnapStore } from './services/pnapStore';
 import { auth, signInWithGoogle, signOutFirebase, fetchAuthenticatedPnapUser } from './firebase';
+import { fetchCurrentApiUser, isApiConfigured } from './services/apiClient';
 import { AngolaMap } from './components/AngolaMap';
 import { ProvincialSummaryCard } from './components/ProvincialSummaryCard';
 import { NationalInmateSearch } from './components/NationalInmateSearch';
@@ -42,7 +43,9 @@ export default function App() {
       setFirebaseUser(user);
       if (user) {
         try {
-          const officialUser = await fetchAuthenticatedPnapUser(user.uid);
+          const officialUser = isApiConfigured()
+            ? await fetchCurrentApiUser().catch(() => fetchAuthenticatedPnapUser(user.uid))
+            : await fetchAuthenticatedPnapUser(user.uid);
           if (officialUser) {
             setCurrentUser(officialUser);
             if (

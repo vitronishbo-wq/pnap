@@ -1,0 +1,17 @@
+{
+  "projects": {
+    "default": "gen-lang-client-0559607571"
+  },
+  "targets": {
+    "gen-lang-client-0559607571": {
+      "hosting": {
+        "gov": [
+          "pnap-gov"
+        ],
+        "angola": [
+          "pnap-angola"
+        ]
+      }
+    }
+  }
+}

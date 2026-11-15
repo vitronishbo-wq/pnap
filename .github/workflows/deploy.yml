@@ -42,6 +42,8 @@ jobs:
 
       - name: 7. Build do Frontend PWA (dist/)
         run: bun run build
+        env:
+          VITE_API_BASE_URL: https://pnap-api.onrender.com
 
       - name: 8. Build do Backend Express (server.js)
         run: bun run build:server
@@ -53,7 +55,7 @@ jobs:
           path: dist/
 
   # ============================================================================
-  # ETAPA 2: Deploy do Frontend (Hosting) e Regras (Firestore) no Firebase
+  # ETAPA 2: Deploy do Frontend (Hosting Multi-Site) e Regras (Firestore)
   # ============================================================================
   deploy-firebase:
     name: Deploy Firebase (Hosting + Rules)
@@ -75,22 +77,14 @@ jobs:
           name: build-dist
           path: dist/
 
-      - name: 4. Deploy no Firebase Hosting (PWA)
-        uses: FirebaseExtended/action-hosting-deploy@v0
-        with:
-          repoToken: ${{ secrets.GITHUB_TOKEN }}
-          firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
-          channelId: live
-          projectId: gen-lang-client-0559607571
-
-      - name: 5. Publicar Regras Atualizadas do Firestore
+      - name: 4. Publicar Hosting (pnap-gov + pnap-angola) e Regras Firestore
         env:
           FIREBASE_SA: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
         run: |
           trap 'rm -f service-account.json' EXIT
           printf '%s' "$FIREBASE_SA" > service-account.json
           export GOOGLE_APPLICATION_CREDENTIALS="$(pwd)/service-account.json"
-          npx -y firebase-tools deploy --only firestore:rules --project gen-lang-client-0559607571 --non-interactive
+          npx -y firebase-tools deploy --only hosting:gov,hosting:angola,firestore:rules --project gen-lang-client-0559607571 --non-interactive
 
   # ============================================================================
   # ETAPA 3: Disparar Deploy do Backend Express no Render
