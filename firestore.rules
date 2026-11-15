@@ -1,0 +1,387 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // 1. Global Safety Net (Default Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 2. Hardened Global Helpers
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isBootstrappedAdmin() {
+      return isVerifiedUser() && request.auth.token.email == '3silajaneiro@gmail.com';
+    }
+
+    function isAdmin() {
+      return isVerifiedUser() && (
+        isBootstrappedAdmin() ||
+        exists(/databases/$(database)/documents/pnap_admins/$(request.auth.uid))
+      );
+    }
+
+    function hasUserProfile() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/pnap_users/$(request.auth.uid));
+    }
+
+    function getUserDoc() {
+      return get(/databases/$(database)/documents/pnap_users/$(request.auth.uid)).data;
+    }
+
+    function isActivePnapUser() {
+      return hasUserProfile() &&
+        getUserDoc().profile is map &&
+        getUserDoc().profile.status == 'active' &&
+        getUserDoc().assignments is map;
+    }
+
+    function getUserProvince() {
+      return getUserDoc().assignments.assignedProvinceId;
+    }
+
+    function getUserRole() {
+      return getUserDoc().assignments.role;
+    }
+
+    function isValidProvince(prov) {
+      return prov is string && prov in [
+        'luanda', 'icolo_e_bengo', 'bengo', 'cuanza_norte', 'cuanza_sul',
+        'malanje', 'uige', 'zaire', 'cabinda', 'lunda_norte', 'lunda_sul',
+        'benguela', 'huambo', 'bie', 'moxico', 'moxico_leste', 'huila',
+        'namibe', 'cunene', 'cuando', 'cubango'
+      ];
+    }
+
+    // 3. Entity Validation Blueprints
+    function isValidAdminDoc(data, uid) {
+      return data.keys().hasAll(['uid', 'email', 'role', 'createdAt']) &&
+        data.keys().hasOnly(['uid', 'email', 'role', 'createdAt']) &&
+        isValidId(data.uid) &&
+        data.uid == uid &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 200 &&
+        data.role == 'CENTRAL_ADMIN' &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidPnapUserDoc(data, uid) {
+      return data.keys().hasAll(['uid', 'profile', 'assignments']) &&
+        data.keys().hasOnly(['uid', 'profile', 'assignments']) &&
+        isValidId(data.uid) &&
+        data.uid == uid &&
+        data.profile is map &&
+        data.profile.keys().hasAll(['uid', 'fullName', 'email', 'status']) &&
+        data.profile.fullName is string && data.profile.fullName.size() <= 200 &&
+        data.profile.email is string && data.profile.email.size() <= 200 &&
+        data.profile.status in ['active', 'suspended'] &&
+        data.assignments is map &&
+        data.assignments.keys().hasAll(['role', 'assignedProvinceId']) &&
+        data.assignments.role in ['CENTRAL_ADMIN', 'PROVINCIAL_COMMAND', 'ESTABLISHMENT_DIRECTOR', 'OPERATIONAL_OFFICER'] &&
+        data.assignments.assignedProvinceId is string && data.assignments.assignedProvinceId.size() <= 40;
+    }
+
+    function isValidProvinceStats(data) {
+      return data.keys().hasAll(['periodId', 'activeInmates', 'totalCapacity', 'establishmentsCount']) &&
+        data.keys().hasOnly([
+          'periodId', 'activeInmates', 'totalCapacity', 'occupancyRate',
+          'availableSpots', 'establishmentsCount', 'preventiveCount',
+          'convictedCount', 'maleCount', 'femaleCount'
+        ]) &&
+        data.periodId is string && data.periodId.size() <= 32 &&
+        data.activeInmates is int && data.activeInmates >= 0 &&
+        data.totalCapacity is int && data.totalCapacity >= 0 &&
+        data.establishmentsCount is int && data.establishmentsCount >= 0;
+    }
+
+    function isValidEstablishment(data, estId) {
+      return data.keys().hasAll(['establishmentId', 'provinceId', 'name', 'totalCapacity', 'activeInmatesCount', 'provisioningStatus']) &&
+        data.keys().hasOnly([
+          'establishmentId', 'provinceId', 'name', 'code', 'type', 'securityLevel',
+          'directorName', 'address', 'totalCapacity', 'activeInmatesCount', 'pavilions',
+          'provisioningStatus', 'homologatedAt', 'homologatedBy', 'homologationDecreeNumber'
+        ]) &&
+        isValidId(data.establishmentId) &&
+        data.establishmentId == estId &&
+        isValidProvince(data.provinceId) &&
+        data.name is string && data.name.size() <= 200 &&
+        data.totalCapacity is int && data.totalCapacity >= 0 &&
+        data.activeInmatesCount is int && data.activeInmatesCount >= 0 &&
+        data.provisioningStatus in ['DRAFT', 'HOMOLOGATED'];
+    }
+
+    function isValidInmate(data, inmateId) {
+      return data.keys().hasAll(['inmateId', 'provinceId', 'establishmentId', 'currentStatus']) &&
+        data.keys().hasOnly([
+          'inmateId', 'provinceId', 'establishmentId', 'pavilionId', 'blockId', 'cellId',
+          'profile', 'admission', 'legal', 'health', 'rehabilitation', 'disciplinary',
+          'incidents', 'postInstitutional', 'documents', 'currentStatus'
+        ]) &&
+        isValidId(data.inmateId) &&
+        data.inmateId == inmateId &&
+        isValidProvince(data.provinceId) &&
+        isValidId(data.establishmentId) &&
+        data.currentStatus in ['ATIVO', 'TRANSFERIDO', 'LIBERTADO', 'EVADIDO', 'FALECIDO'];
+    }
+
+    function isValidNationalIndex(data, inmateId) {
+      return data.keys().hasAll(['inmateId', 'matricula', 'fullName', 'provinceId', 'establishmentId', 'legalStatus']) &&
+        data.keys().hasOnly([
+          'inmateId', 'matricula', 'fullName', 'alias', 'biNumber', 'provinceId', 'provinceName',
+          'establishmentId', 'establishmentName', 'pavilionName', 'cellCode', 'legalStatus',
+          'crimeCategory', 'penalCodeArticle', 'parentName', 'emergencyContactName',
+          'emergencyPhone', 'neighborhood', 'photoUrl', 'lastUpdated', 'custodyStatus'
+        ]) &&
+        isValidId(data.inmateId) &&
+        data.inmateId == inmateId &&
+        data.matricula is string && data.matricula.size() >= 1 && data.matricula.size() <= 64 &&
+        data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 200 &&
+        isValidProvince(data.provinceId) &&
+        isValidId(data.establishmentId) &&
+        data.legalStatus in ['PREVENTIVO', 'CONDENADO', 'RECORRENTE', 'TRANSITO_EM_JULGADO'];
+    }
+
+    function isValidAdmission(data, admissionId) {
+      return data.keys().hasAll(['admissionId', 'inmateId', 'provinceId', 'establishmentId', 'timestamp']) &&
+        data.keys().hasOnly(['admissionId', 'inmateId', 'fullName', 'matricula', 'provinceId', 'establishmentId', 'courtName', 'crime', 'timestamp', 'registeredBy']) &&
+        isValidId(data.admissionId) &&
+        data.admissionId == admissionId &&
+        isValidId(data.inmateId) &&
+        isValidProvince(data.provinceId) &&
+        isValidId(data.establishmentId) &&
+        data.timestamp is string && data.timestamp.size() <= 64;
+    }
+
+    function isValidRelease(data, releaseId) {
+      return data.keys().hasAll(['releaseId', 'inmateId', 'provinceId', 'establishmentId', 'reason']) &&
+        data.keys().hasOnly([
+          'releaseId', 'inmateId', 'fullName', 'matricula', 'provinceId', 'establishmentId',
+          'alvaraNumber', 'judgeName', 'releaseDate', 'reason', 'resultingStatus',
+          'destinationProvinceId', 'destinationEstablishmentId', 'notes', 'registeredBy', 'registeredAt'
+        ]) &&
+        isValidId(data.releaseId) &&
+        data.releaseId == releaseId &&
+        isValidId(data.inmateId) &&
+        isValidProvince(data.provinceId) &&
+        isValidId(data.establishmentId) &&
+        data.reason in ['CUMPRIMENTO_PENA', 'LIBERDADE_CONDICIONAL', 'LIBERDADE_PROVISORIA', 'ABSOLVICAO', 'INDULTO', 'OBITO', 'EVASAO', 'TRANSFERENCIA'];
+    }
+
+    function isValidTransition(data, transitionId) {
+      return data.keys().hasAll(['transitionId', 'inmateId', 'provinceId', 'establishmentId', 'newStatus']) &&
+        data.keys().hasOnly([
+          'transitionId', 'inmateId', 'inmateName', 'matricula', 'provinceId', 'establishmentId',
+          'previousStatus', 'newStatus', 'courtName', 'sentenceAcordaoNumber', 'sentenceDate',
+          'transitDate', 'totalSentenceYears', 'totalSentenceMonths', 'regime', 'judgeName',
+          'effectiveDate', 'registeredBy', 'notes'
+        ]) &&
+        isValidId(data.transitionId) &&
+        data.transitionId == transitionId &&
+        isValidId(data.inmateId) &&
+        isValidProvince(data.provinceId) &&
+        isValidId(data.establishmentId) &&
+        data.newStatus in ['CONDENADO', 'TRANSITO_EM_JULGADO'];
+    }
+
+    function isValidTransfer(data, transferId) {
+      return data.keys().hasAll(['transferId', 'inmateId', 'originProvinceId', 'destinationProvinceId', 'status']) &&
+        data.keys().hasOnly([
+          'transferId', 'inmateId', 'inmateName', 'matricula', 'originProvinceId',
+          'originEstablishmentId', 'destinationProvinceId', 'destinationEstablishmentId',
+          'requestDate', 'status', 'justification', 'securityEscort', 'authorizedBy'
+        ]) &&
+        isValidId(data.transferId) &&
+        data.transferId == transferId &&
+        isValidId(data.inmateId) &&
+        isValidProvince(data.originProvinceId) &&
+        isValidProvince(data.destinationProvinceId) &&
+        data.status in ['PENDENTE', 'AUTORIZADO_CENTRAL', 'EM_TRANSITO', 'CONCLUIDO', 'REJEITADO'];
+    }
+
+    function isValidAuditLog(data, eventId) {
+      return data.keys().hasAll(['eventId', 'timestamp', 'userId', 'userRole', 'userScopeProvince', 'action', 'jurisdictionStatus']) &&
+        data.keys().hasOnly([
+          'eventId', 'timestamp', 'userId', 'userName', 'userRole', 'userScopeProvince',
+          'action', 'targetResource', 'details', 'ipAddress', 'jurisdictionStatus'
+        ]) &&
+        isValidId(data.eventId) &&
+        data.eventId == eventId &&
+        data.timestamp is string && data.timestamp.size() <= 64 &&
+        isValidId(data.userId) &&
+        data.userRole in ['CENTRAL_ADMIN', 'PROVINCIAL_COMMAND', 'ESTABLISHMENT_DIRECTOR', 'OPERATIONAL_OFFICER'] &&
+        data.userScopeProvince is string && data.userScopeProvince.size() <= 40 &&
+        data.action is string && data.action.size() <= 120 &&
+        data.jurisdictionStatus in ['AUTHORIZED', 'CROSS_PROVINCE_QUERY', 'BLOCKED_ATTEMPT'];
+    }
+
+    // 4. Connection Probe Path (Zero PII, Read-Only Get)
+    match /test/connection {
+      allow get: if true;
+    }
+
+    // 5. Central Admin Registry (Admin-Only Control)
+    match /pnap_admins/{uid} {
+      allow get: if isValidId(uid) && (isAdmin() || (isSignedIn() && request.auth.uid == uid));
+      allow list: if isAdmin();
+      allow create: if isValidId(uid) && isAdmin() && isValidAdminDoc(incoming(), uid) && incoming().createdAt == request.time;
+      allow update, delete: if isValidId(uid) && isAdmin() && incoming().uid == existing().uid;
+    }
+
+    // 6. PNAP Users (Strict PII Isolation + Zero Self-Escalation)
+    match /pnap_users/{uid} {
+      allow get: if isValidId(uid) && (isAdmin() || (isSignedIn() && request.auth.uid == uid));
+      allow list: if isAdmin();
+      allow create: if isValidId(uid) && isAdmin() && isValidPnapUserDoc(incoming(), uid);
+      allow update: if isValidId(uid) && isValidPnapUserDoc(incoming(), uid) && (
+        (isAdmin() && incoming().uid == existing().uid) ||
+        (isVerifiedUser() &&
+          request.auth.uid == uid &&
+          incoming().uid == existing().uid &&
+          incoming().assignments == existing().assignments &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['profile']) &&
+          incoming().profile.status == existing().profile.status)
+      );
+      allow delete: if isValidId(uid) && isAdmin();
+    }
+
+    // 7. Provincial Statistics (RDPA 2024)
+    match /pnap_province_stats/{provinceId} {
+      allow get: if isValidProvince(provinceId) && (isAdmin() || (isActivePnapUser() && getUserProvince() == provinceId));
+      allow list: if isAdmin() || (isActivePnapUser() && resource.data.provinceId == getUserProvince());
+      allow create, update: if isValidProvince(provinceId) && isAdmin() && isValidProvinceStats(incoming());
+      allow delete: if false;
+    }
+
+    // 8. Establishments (Two-Phase Provisioning Restricted to CENTRAL_ADMIN)
+    match /pnap_establishments/{establishmentId} {
+      allow get: if isValidId(establishmentId) && (
+        isAdmin() || (isActivePnapUser() && existing().provinceId == getUserProvince())
+      );
+      allow list: if isAdmin() || (isActivePnapUser() && resource.data.provinceId == getUserProvince());
+      allow create, update: if isValidId(establishmentId) && isAdmin() && isValidEstablishment(incoming(), establishmentId);
+      allow delete: if false;
+    }
+
+    // 9. Inmates (Strict Provincial Isolation + Terminal State Lock)
+    match /pnap_inmates/{inmateId} {
+      allow get: if isValidId(inmateId) && (
+        isAdmin() || (isActivePnapUser() && existing().provinceId == getUserProvince())
+      );
+      allow list: if isAdmin() || (isActivePnapUser() && resource.data.provinceId == getUserProvince());
+      allow create: if isValidId(inmateId) && isVerifiedUser() && isValidInmate(incoming(), inmateId) && (
+        isAdmin() || (isActivePnapUser() && incoming().provinceId == getUserProvince())
+      );
+      allow update: if isValidId(inmateId) && isVerifiedUser() && isValidInmate(incoming(), inmateId) &&
+        incoming().inmateId == existing().inmateId &&
+        incoming().provinceId == existing().provinceId && (
+          isAdmin() || (
+            isActivePnapUser() &&
+            existing().provinceId == getUserProvince() &&
+            existing().currentStatus == 'ATIVO' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['legal', 'documents', 'currentStatus'])
+          )
+        );
+      allow delete: if false;
+    }
+
+    // 10. National Inmate Index (Federated Read for Active Operators, Scoped Writes)
+    match /pnap_national_inmate_index/{inmateId} {
+      allow get: if isValidId(inmateId) && (isAdmin() || isActivePnapUser());
+      allow list: if isAdmin() || (isActivePnapUser() && resource.data.provinceId is string);
+      allow create, update: if isValidId(inmateId) && isVerifiedUser() && isValidNationalIndex(incoming(), inmateId) && (
+        isAdmin() || (isActivePnapUser() && incoming().provinceId == getUserProvince())
+      );
+      allow delete: if false;
+    }
+
+    // 11. Admissions (Immutable History)
+    match /pnap_admissions/{admissionId} {
+      allow get: if isValidId(admissionId) && (
+        isAdmin() || (isActivePnapUser() && existing().provinceId == getUserProvince())
+      );
+      allow list: if isAdmin() || (isActivePnapUser() && resource.data.provinceId == getUserProvince());
+      allow create: if isValidId(admissionId) && isVerifiedUser() && isValidAdmission(incoming(), admissionId) && (
+        isAdmin() || (isActivePnapUser() && incoming().provinceId == getUserProvince())
+      );
+      allow update, delete: if false;
+    }
+
+    // 12. Releases / Exits (Immutable History)
+    match /pnap_releases/{releaseId} {
+      allow get: if isValidId(releaseId) && (
+        isAdmin() || (isActivePnapUser() && existing().provinceId == getUserProvince())
+      );
+      allow list: if isAdmin() || (isActivePnapUser() && resource.data.provinceId == getUserProvince());
+      allow create: if isValidId(releaseId) && isVerifiedUser() && isValidRelease(incoming(), releaseId) && (
+        isAdmin() || (isActivePnapUser() && incoming().provinceId == getUserProvince())
+      );
+      allow update, delete: if false;
+    }
+
+    // 13. Legal Transitions (Immutable History)
+    match /pnap_legal_transitions/{transitionId} {
+      allow get: if isValidId(transitionId) && (
+        isAdmin() || (isActivePnapUser() && existing().provinceId == getUserProvince())
+      );
+      allow list: if isAdmin() || (isActivePnapUser() && resource.data.provinceId == getUserProvince());
+      allow create: if isValidId(transitionId) && isVerifiedUser() && isValidTransition(incoming(), transitionId) && (
+        isAdmin() || (isActivePnapUser() && incoming().provinceId == getUserProvince())
+      );
+      allow update, delete: if false;
+    }
+
+    // 14. Physical Transfers
+    match /pnap_transfers/{transferId} {
+      allow get: if isValidId(transferId) && (
+        isAdmin() || (
+          isActivePnapUser() &&
+          (existing().originProvinceId == getUserProvince() || existing().destinationProvinceId == getUserProvince())
+        )
+      );
+      allow list: if isAdmin() || (isActivePnapUser() && resource.data.originProvinceId == getUserProvince());
+      allow create: if isValidId(transferId) && isVerifiedUser() && isValidTransfer(incoming(), transferId) && (
+        isAdmin() || (isActivePnapUser() && incoming().originProvinceId == getUserProvince())
+      );
+      allow update: if isValidId(transferId) && isAdmin() && isValidTransfer(incoming(), transferId) && incoming().transferId == existing().transferId;
+      allow delete: if false;
+    }
+
+    // 15. Immutable Audit Logs (Append-Only by Verified Operators, Read Restricted to Command/Admin)
+    match /pnap_audit_logs/{eventId} {
+      allow get: if isValidId(eventId) && (
+        isAdmin() || (
+          isActivePnapUser() &&
+          getUserRole() == 'PROVINCIAL_COMMAND' &&
+          existing().userScopeProvince == getUserProvince()
+        )
+      );
+      allow list: if isAdmin() || (
+        isActivePnapUser() &&
+        getUserRole() == 'PROVINCIAL_COMMAND' &&
+        resource.data.userScopeProvince == getUserProvince()
+      );
+      allow create: if isValidId(eventId) && isVerifiedUser() && isValidAuditLog(incoming(), eventId) &&
+        incoming().userId == request.auth.uid;
+      allow update, delete: if false;
+    }
+  }
+}

@@ -4,10 +4,12 @@
  */
 
 import React, { useState, useEffect } from 'react';
-import { Shield, SlidersHorizontal, UserCheck, ArrowRightLeft, UserPlus, Users, Search, Plus, Building2, FileText, CheckCircle2, AlertCircle, Sparkles } from 'lucide-react';
-import { ProvinceId, UserRole, Inmate, NationalInmateIndexItem } from './types/pnap';
-import { MOCK_USERS, INMATES_LOCAL_DB, NATIONAL_INMATE_INDEX, PROVINCES_DATA } from './data/mockPnapData';
+import { Shield, SlidersHorizontal, UserCheck, ArrowRightLeft, UserPlus, Users, Search, Plus, Building2, LogIn, LogOut } from 'lucide-react';
+import { onAuthStateChanged, type User as FirebaseAuthUser } from 'firebase/auth';
+import { ProvinceId, Inmate, NationalInmateIndexItem } from './types/pnap';
+import { MOCK_USERS, INMATES_LOCAL_DB } from './data/mockPnapData';
 import { pnapStore } from './services/pnapStore';
+import { auth, signInWithGoogle, signOutFirebase, fetchAuthenticatedPnapUser } from './firebase';
 import { AngolaMap } from './components/AngolaMap';
 import { ProvincialSummaryCard } from './components/ProvincialSummaryCard';
 import { NationalInmateSearch } from './components/NationalInmateSearch';
@@ -28,13 +30,61 @@ export default function App() {
   const [selectedInmateForDossier, setSelectedInmateForDossier] = useState<Inmate | null>(null);
   const [transferTargetInmate, setTransferTargetInmate] = useState<NationalInmateIndexItem | null>(null);
   const [, setStoreTick] = useState(0);
+  const [firebaseUser, setFirebaseUser] = useState<FirebaseAuthUser | null>(null);
+  const [authBusy, setAuthBusy] = useState(false);
 
   useEffect(() => {
     return pnapStore.subscribe(() => setStoreTick((t) => t + 1));
   }, []);
 
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      setFirebaseUser(user);
+      if (user) {
+        try {
+          const officialUser = await fetchAuthenticatedPnapUser(user.uid);
+          if (officialUser) {
+            setCurrentUser(officialUser);
+            if (
+              officialUser.assignments.role !== 'CENTRAL_ADMIN' &&
+              officialUser.assignments.assignedProvinceId !== 'all'
+            ) {
+              setSelectedProvinceId(officialUser.assignments.assignedProvinceId as ProvinceId);
+            }
+          }
+        } catch {
+          // Utilizador autenticado ainda sem registo em pnap_users ou erro registado via handleFirestoreError
+        }
+      }
+    });
+    return () => unsubscribe();
+  }, []);
+
   // Alerta de feedback temporário para ações de segurança (nulo por defeito para manter ecrã principal 100% limpo)
   const [bannerNotice, setBannerNotice] = useState<string | null>(null);
+
+  const handleFirebaseSignIn = async () => {
+    setAuthBusy(true);
+    try {
+      const signed = await signInWithGoogle();
+      setBannerNotice(`Sessão Firebase ativa: ${signed.email || signed.uid}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Falha na autenticação Google.';
+      setBannerNotice(`Autenticação cancelada ou recusada: ${msg}`);
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const handleFirebaseSignOut = async () => {
+    setAuthBusy(true);
+    try {
+      await signOutFirebase();
+      setBannerNotice('Sessão Firebase terminada.');
+    } finally {
+      setAuthBusy(false);
+    }
+  };
 
   const handleRoleChange = (userId: string) => {
     const user = MOCK_USERS.find((u) => u.uid === userId);
@@ -58,12 +108,12 @@ export default function App() {
     if (found) {
       // Verificar se utilizador tem permissão
       if (currentUser.assignments.role !== 'CENTRAL_ADMIN' && found.provinceId !== currentUser.assignments.assignedProvinceId) {
-        alert(`[VIOLAÇÃO DE JURISDIÇÃO BLOQUEADA]\nNão é permitido abrir o processo interno confidencial da província de ${found.provinceId.toUpperCase()} a partir do terminal de Luanda.`);
+        setBannerNotice(`Jurisdição bloqueada: dossier confidencial pertence a ${found.provinceId.toUpperCase()}.`);
         return;
       }
       setSelectedInmateForDossier(found);
     } else {
-      alert('Dossier confidencial localizado em servidor provincial remoto. Acesso restrito aos operadores locais.');
+      setBannerNotice('Dossier confidencial localizado em servidor provincial remoto.');
     }
   };
 
@@ -156,6 +206,38 @@ export default function App() {
               >
                 ✕
               </button>
+            </div>
+
+            <div className="mb-2 p-2 rounded-xl bg-[#0b192c] border border-blue-900/60 flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                  Firebase Auth
+                </div>
+                <div className="text-[11px] text-slate-200 truncate">
+                  {firebaseUser ? (firebaseUser.email || firebaseUser.uid) : 'Não autenticado'}
+                </div>
+              </div>
+              {firebaseUser ? (
+                <button
+                  type="button"
+                  disabled={authBusy}
+                  onClick={handleFirebaseSignOut}
+                  className="shrink-0 flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-semibold cursor-pointer disabled:opacity-50"
+                >
+                  <LogOut className="w-3 h-3" />
+                  <span>Sair</span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  disabled={authBusy}
+                  onClick={handleFirebaseSignIn}
+                  className="shrink-0 flex items-center gap-1 px-2.5 py-1 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-[11px] font-semibold cursor-pointer disabled:opacity-50"
+                >
+                  <LogIn className="w-3 h-3" />
+                  <span>Entrar Google</span>
+                </button>
+              )}
             </div>
 
             <div className="space-y-1.5 max-h-48 overflow-y-auto">

@@ -1,0 +1,437 @@
+{
+  "entities": {
+    "PnapAdmin": {
+      "title": "PnapAdmin",
+      "description": "Registo oficial de administradores centrais (CENTRAL_ADMIN) autorizados no PNAP.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 200
+        },
+        "role": {
+          "type": "string",
+          "enum": ["CENTRAL_ADMIN"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "email", "role", "createdAt"]
+    },
+    "PnapUser": {
+      "title": "PnapUser",
+      "description": "Perfil operacional e matriz RBAC oficial do utilizador PNAP.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "profile": {
+          "type": "object",
+          "description": "Dados funcionais do agente ou dirigente prisional."
+        },
+        "assignments": {
+          "type": "object",
+          "description": "Atribuição de cargo, província e estabelecimento."
+        }
+      },
+      "required": ["uid", "profile", "assignments"]
+    },
+    "ProvinceStatistics": {
+      "title": "ProvinceStatistics",
+      "description": "Estatísticas prisionais consolidadas por província (RDPA 2024).",
+      "type": "object",
+      "properties": {
+        "periodId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "activeInmates": {
+          "type": "integer"
+        },
+        "totalCapacity": {
+          "type": "integer"
+        },
+        "occupancyRate": {
+          "type": "number"
+        },
+        "availableSpots": {
+          "type": "integer"
+        },
+        "establishmentsCount": {
+          "type": "integer"
+        },
+        "preventiveCount": {
+          "type": "integer"
+        },
+        "convictedCount": {
+          "type": "integer"
+        },
+        "maleCount": {
+          "type": "integer"
+        },
+        "femaleCount": {
+          "type": "integer"
+        }
+      },
+      "required": ["periodId", "activeInmates", "totalCapacity", "establishmentsCount"]
+    },
+    "EstablishmentProfile": {
+      "title": "EstablishmentProfile",
+      "description": "Unidade prisional provisionada em duas fases (DRAFT / HOMOLOGATED).",
+      "type": "object",
+      "properties": {
+        "establishmentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "provinceId": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "code": {
+          "type": "string",
+          "maxLength": 50
+        },
+        "type": {
+          "type": "string",
+          "enum": ["PENITENCIARIA", "COMARCA", "CENTRO_JUVENIL", "HOSPITAL_PRISIONAL"]
+        },
+        "securityLevel": {
+          "type": "string",
+          "enum": ["MAXIMA", "MEDIA", "COMUM"]
+        },
+        "totalCapacity": {
+          "type": "integer"
+        },
+        "activeInmatesCount": {
+          "type": "integer"
+        },
+        "provisioningStatus": {
+          "type": "string",
+          "enum": ["DRAFT", "HOMOLOGATED"]
+        }
+      },
+      "required": ["establishmentId", "provinceId", "name", "totalCapacity", "activeInmatesCount", "provisioningStatus"]
+    },
+    "Inmate": {
+      "title": "Inmate",
+      "description": "Ficha Única do recluso na província e unidade prisional de tutela.",
+      "type": "object",
+      "properties": {
+        "inmateId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "provinceId": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40
+        },
+        "establishmentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "currentStatus": {
+          "type": "string",
+          "enum": ["ATIVO", "TRANSFERIDO", "LIBERTADO", "EVADIDO", "FALECIDO"]
+        }
+      },
+      "required": ["inmateId", "provinceId", "establishmentId", "currentStatus"]
+    },
+    "NationalInmateIndexItem": {
+      "title": "NationalInmateIndexItem",
+      "description": "Índice nacional federado de localização rápida de reclusos.",
+      "type": "object",
+      "properties": {
+        "inmateId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "matricula": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "fullName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "provinceId": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40
+        },
+        "establishmentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "legalStatus": {
+          "type": "string",
+          "enum": ["PREVENTIVO", "CONDENADO", "RECORRENTE", "TRANSITO_EM_JULGADO"]
+        }
+      },
+      "required": ["inmateId", "matricula", "fullName", "provinceId", "establishmentId", "legalStatus"]
+    },
+    "AdmissionRecord": {
+      "title": "AdmissionRecord",
+      "description": "Registo histórico de internamento de recluso.",
+      "type": "object",
+      "properties": {
+        "admissionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "inmateId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "provinceId": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40
+        },
+        "establishmentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["admissionId", "inmateId", "provinceId", "establishmentId", "timestamp"]
+    },
+    "ReleaseRecord": {
+      "title": "ReleaseRecord",
+      "description": "Registo histórico de saída e modalidade (8 modalidades).",
+      "type": "object",
+      "properties": {
+        "releaseId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "inmateId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "provinceId": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40
+        },
+        "establishmentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "reason": {
+          "type": "string",
+          "enum": [
+            "CUMPRIMENTO_PENA",
+            "LIBERDADE_CONDICIONAL",
+            "LIBERDADE_PROVISORIA",
+            "ABSOLVICAO",
+            "INDULTO",
+            "OBITO",
+            "EVASAO",
+            "TRANSFERENCIA"
+          ]
+        },
+        "resultingStatus": {
+          "type": "string",
+          "enum": ["LIBERTADO", "FALECIDO", "EVADIDO", "TRANSFERIDO"]
+        }
+      },
+      "required": ["releaseId", "inmateId", "provinceId", "establishmentId", "reason"]
+    },
+    "LegalTransitionRecord": {
+      "title": "LegalTransitionRecord",
+      "description": "Registo de transição jurídico-penal (Preventivo -> Condenado).",
+      "type": "object",
+      "properties": {
+        "transitionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "inmateId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "provinceId": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40
+        },
+        "establishmentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "newStatus": {
+          "type": "string",
+          "enum": ["CONDENADO", "TRANSITO_EM_JULGADO"]
+        }
+      },
+      "required": ["transitionId", "inmateId", "provinceId", "establishmentId", "newStatus"]
+    },
+    "TransferRecord": {
+      "title": "TransferRecord",
+      "description": "Guia de transferência física interprovincial ou interunidades.",
+      "type": "object",
+      "properties": {
+        "transferId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "inmateId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "originProvinceId": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40
+        },
+        "destinationProvinceId": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40
+        },
+        "status": {
+          "type": "string",
+          "enum": ["PENDENTE", "AUTORIZADO_CENTRAL", "EM_TRANSITO", "CONCLUIDO", "REJEITADO"]
+        }
+      },
+      "required": ["transferId", "inmateId", "originProvinceId", "destinationProvinceId", "status"]
+    },
+    "AuditLogEvent": {
+      "title": "AuditLogEvent",
+      "description": "Evento imutável de auditoria operacional e segurança RBAC do PNAP.",
+      "type": "object",
+      "properties": {
+        "eventId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "userId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "userRole": {
+          "type": "string",
+          "enum": ["CENTRAL_ADMIN", "PROVINCIAL_COMMAND", "ESTABLISHMENT_DIRECTOR", "OPERATIONAL_OFFICER"]
+        },
+        "userScopeProvince": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40
+        },
+        "action": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "jurisdictionStatus": {
+          "type": "string",
+          "enum": ["AUTHORIZED", "CROSS_PROVINCE_QUERY", "BLOCKED_ATTEMPT"]
+        }
+      },
+      "required": ["eventId", "timestamp", "userId", "userRole", "userScopeProvince", "action", "jurisdictionStatus"]
+    }
+  },
+  "firestore": {
+    "/pnap_admins/{uid}": {
+      "schema": { "$ref": "#/entities/PnapAdmin" },
+      "description": "Registo de administradores centrais PNAP verificados."
+    },
+    "/pnap_users/{uid}": {
+      "schema": { "$ref": "#/entities/PnapUser" },
+      "description": "Perfis e atribuições RBAC oficiais dos utilizadores PNAP."
+    },
+    "/pnap_province_stats/{provinceId}": {
+      "schema": { "$ref": "#/entities/ProvinceStatistics" },
+      "description": "Indicadores prisionais por província (RDPA 2024)."
+    },
+    "/pnap_establishments/{establishmentId}": {
+      "schema": { "$ref": "#/entities/EstablishmentProfile" },
+      "description": "Estabelecimentos prisionais e estrutura de pavilhões/blocos/celas."
+    },
+    "/pnap_inmates/{inmateId}": {
+      "schema": { "$ref": "#/entities/Inmate" },
+      "description": "Fichas únicas de reclusos sob tutela provincial."
+    },
+    "/pnap_national_inmate_index/{inmateId}": {
+      "schema": { "$ref": "#/entities/NationalInmateIndexItem" },
+      "description": "Índice nacional federado para localização interprovincial."
+    },
+    "/pnap_admissions/{admissionId}": {
+      "schema": { "$ref": "#/entities/AdmissionRecord" },
+      "description": "Histórico imutável de entradas e internamentos."
+    },
+    "/pnap_releases/{releaseId}": {
+      "schema": { "$ref": "#/entities/ReleaseRecord" },
+      "description": "Histórico imutável de saídas e modalidades."
+    },
+    "/pnap_legal_transitions/{transitionId}": {
+      "schema": { "$ref": "#/entities/LegalTransitionRecord" },
+      "description": "Histórico de transições jurídico-penais."
+    },
+    "/pnap_transfers/{transferId}": {
+      "schema": { "$ref": "#/entities/TransferRecord" },
+      "description": "Guias de transferência física interprovincial."
+    },
+    "/pnap_audit_logs/{eventId}": {
+      "schema": { "$ref": "#/entities/AuditLogEvent" },
+      "description": "Trilha imutável de auditoria RBAC e operações PNAP."
+    }
+  }
+}

@@ -1,0 +1,108 @@
+name: PNAP - CI/CD Automação Total
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: pnap-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ============================================================================
+  # ETAPA 1: Validação, Lint das Regras, Typecheck e Build (Frontend + Backend)
+  # ============================================================================
+  build-and-verify:
+    name: Validar Código e Regras
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Baixar código do repositório
+        uses: actions/checkout@v4
+
+      - name: 2. Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 3. Configurar Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: 4. Instalar dependências (bun.lock)
+        run: bun install --frozen-lockfile
+
+      - name: 5. Auditar Regras de Segurança Firestore (ESLint)
+        run: npx eslint firestore.rules
+
+      - name: 6. Verificar Tipagem (Typecheck)
+        run: bun run lint
+
+      - name: 7. Build do Frontend PWA (dist/)
+        run: bun run build
+
+      - name: 8. Build do Backend Express (server.js)
+        run: bun run build:server
+
+      - name: 9. Salvar artefatos compilados (dist) para o deploy
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-dist
+          path: dist/
+
+  # ============================================================================
+  # ETAPA 2: Deploy do Frontend (Hosting) e Regras (Firestore) no Firebase
+  # ============================================================================
+  deploy-firebase:
+    name: Deploy Firebase (Hosting + Rules)
+    needs: build-and-verify
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Baixar código do repositório
+        uses: actions/checkout@v4
+
+      - name: 2. Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 3. Baixar artefatos compilados (dist)
+        uses: actions/download-artifact@v4
+        with:
+          name: build-dist
+          path: dist/
+
+      - name: 4. Deploy no Firebase Hosting (PWA)
+        uses: FirebaseExtended/action-hosting-deploy@v0
+        with:
+          repoToken: ${{ secrets.GITHUB_TOKEN }}
+          firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          channelId: live
+          projectId: gen-lang-client-0559607571
+
+      - name: 5. Publicar Regras Atualizadas do Firestore
+        env:
+          FIREBASE_SA: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          trap 'rm -f service-account.json' EXIT
+          printf '%s' "$FIREBASE_SA" > service-account.json
+          export GOOGLE_APPLICATION_CREDENTIALS="$(pwd)/service-account.json"
+          npx -y firebase-tools deploy --only firestore:rules --project gen-lang-client-0559607571 --non-interactive
+
+  # ============================================================================
+  # ETAPA 3: Disparar Deploy do Backend Express no Render
+  # ============================================================================
+  deploy-render:
+    name: Deploy Backend no Render
+    needs: build-and-verify
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Acionar Deploy Hook do Render
+        env:
+          RENDER_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          curl -fsS -X POST "$RENDER_HOOK_URL"
