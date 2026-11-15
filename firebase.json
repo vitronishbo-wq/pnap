@@ -33,6 +33,21 @@
           "destination": "/index.html"
         }
       ]
+    },
+    {
+      "target": "principal",
+      "public": "dist",
+      "ignore": [
+        "firebase.json",
+        "**/.*",
+        "**/node_modules/**"
+      ],
+      "rewrites": [
+        {
+          "source": "**",
+          "destination": "/index.html"
+        }
+      ]
     }
   ]
 }
