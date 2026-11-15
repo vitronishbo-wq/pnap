@@ -1,0 +1,6 @@
+{
+  "name": "PNAP - Administração Prisional",
+  "description": "Sistema Nacional de Administração Prisional de Angola (RDPA 2024 · 21 Províncias) com gestão multinível, isolamento de competências e índice de reclusos.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
