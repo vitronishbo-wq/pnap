@@ -30,7 +30,12 @@ const VALID_ROLES: readonly UserRole[] = [
   'CENTRAL_ADMIN',
   'PROVINCIAL_COMMAND',
   'ESTABLISHMENT_DIRECTOR',
-  'OPERATIONAL_OFFICER'
+  'OPERATIONAL_OFFICER',
+  'PENAL_CONTROL',
+  'HEALTH_SPECIALIST',
+  'REHABILITATION',
+  'GATE_SECURITY',
+  'AUDITOR_INSPECTOR'
 ] as const;
 
 export function isValidProvinceId(value: unknown): value is ProvinceId {
@@ -48,6 +53,9 @@ export function canProvision(user: PnapUser): boolean {
 export function canOperateProvince(user: PnapUser, provinceId: string): boolean {
   if (!isValidProvinceId(provinceId)) return false;
   if (user.assignments.role === 'CENTRAL_ADMIN') return true;
+  if (user.assignments.role === 'AUDITOR_INSPECTOR' && user.assignments.assignedProvinceId === 'all') {
+    return true;
+  }
   return user.assignments.assignedProvinceId === provinceId;
 }
 
@@ -57,6 +65,9 @@ export function canOperateEstablishment(
   establishmentId: string
 ): boolean {
   if (!canOperateProvince(user, provinceId)) return false;
+  if (user.assignments.role === 'AUDITOR_INSPECTOR') {
+    return false;
+  }
   if (user.assignments.role === 'CENTRAL_ADMIN' || user.assignments.role === 'PROVINCIAL_COMMAND') {
     return true;
   }
@@ -66,16 +77,80 @@ export function canOperateEstablishment(
   return user.assignments.assignedEstablishmentId === establishmentId;
 }
 
+export function canAccessClinicalRecords(
+  user: PnapUser,
+  provinceId: string,
+  establishmentId: string
+): boolean {
+  if (user.assignments.role !== 'HEALTH_SPECIALIST') return false;
+  if (user.assignments.assignedProvinceId === 'all') return true;
+  if (user.assignments.assignedProvinceId !== provinceId) return false;
+  if (!user.assignments.assignedEstablishmentId) return true;
+  return user.assignments.assignedEstablishmentId === establishmentId;
+}
+
+export function canManagePenalControl(
+  user: PnapUser,
+  provinceId: string,
+  establishmentId: string
+): boolean {
+  const allowed: UserRole[] = [
+    'CENTRAL_ADMIN',
+    'PROVINCIAL_COMMAND',
+    'ESTABLISHMENT_DIRECTOR',
+    'OPERATIONAL_OFFICER',
+    'PENAL_CONTROL'
+  ];
+  if (!allowed.includes(user.assignments.role)) return false;
+  return canOperateEstablishment(user, provinceId, establishmentId);
+}
+
+export function canManageRehabilitation(
+  user: PnapUser,
+  provinceId: string,
+  establishmentId: string
+): boolean {
+  const allowed: UserRole[] = [
+    'CENTRAL_ADMIN',
+    'PROVINCIAL_COMMAND',
+    'ESTABLISHMENT_DIRECTOR',
+    'REHABILITATION'
+  ];
+  if (!allowed.includes(user.assignments.role)) return false;
+  return canOperateEstablishment(user, provinceId, establishmentId);
+}
+
+export function canRegisterPhysicalMovement(
+  user: PnapUser,
+  provinceId: string,
+  establishmentId: string
+): boolean {
+  const allowed: UserRole[] = [
+    'CENTRAL_ADMIN',
+    'PROVINCIAL_COMMAND',
+    'ESTABLISHMENT_DIRECTOR',
+    'OPERATIONAL_OFFICER',
+    'PENAL_CONTROL',
+    'GATE_SECURITY'
+  ];
+  if (!allowed.includes(user.assignments.role)) return false;
+  return canOperateEstablishment(user, provinceId, establishmentId);
+}
+
 export function canAuthorizePhysicalTransfer(user: PnapUser, originProvinceId: string): boolean {
   if (!isValidProvinceId(originProvinceId)) return false;
   if (user.assignments.role === 'CENTRAL_ADMIN') return true;
+  if (user.assignments.role === 'AUDITOR_INSPECTOR' || user.assignments.role === 'HEALTH_SPECIALIST') {
+    return false;
+  }
   return user.assignments.assignedProvinceId === originProvinceId;
 }
 
 export function canViewAuditLogs(user: PnapUser): boolean {
   return (
     user.assignments.role === 'CENTRAL_ADMIN' ||
-    user.assignments.role === 'PROVINCIAL_COMMAND'
+    user.assignments.role === 'PROVINCIAL_COMMAND' ||
+    user.assignments.role === 'AUDITOR_INSPECTOR'
   );
 }
 
@@ -213,8 +288,13 @@ export function createRequirePnapAuth(deps: {
       return;
     }
 
+    const isGlobalScopeAllowed =
+      pnapUser.assignments.role === 'CENTRAL_ADMIN' ||
+      (pnapUser.assignments.role === 'AUDITOR_INSPECTOR' &&
+        pnapUser.assignments.assignedProvinceId === 'all');
+
     if (
-      pnapUser.assignments.role !== 'CENTRAL_ADMIN' &&
+      !isGlobalScopeAllowed &&
       !isValidProvinceId(pnapUser.assignments.assignedProvinceId)
     ) {
       res.status(403).json({

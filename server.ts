@@ -4,18 +4,20 @@ import cors from 'cors';
 import type { Firestore } from 'firebase-admin/firestore';
 import { pathToFileURL } from 'node:url';
 import type {
-  AdmissionRecord,
   AuditLogEvent,
   EstablishmentProfile,
   ExitModality,
   Inmate,
-  LegalTransitionRecord,
+  JudicialProcess,
+  MovementRecord,
   NationalInmateIndexItem,
+  PnapCatalog,
   PnapUser,
   ProvinceId,
   ProvinceStatistics,
-  ReleaseRecord,
-  TransferRecord
+  TransferRecord,
+  VisitRecord,
+  VisitorRecord
 } from './src/types/pnap';
 import {
   checkFirestoreConnection,
@@ -24,22 +26,66 @@ import {
 } from './server/firebaseAdmin';
 import {
   RDPA_2024_PROVINCES,
+  canAccessClinicalRecords,
   canAuthorizePhysicalTransfer,
+  canManagePenalControl,
+  canManageRehabilitation,
   canOperateEstablishment,
   canOperateProvince,
   canProvision,
+  canRegisterPhysicalMovement,
   canViewAuditLogs,
   createRequirePnapAuth,
   extractClientIp,
   isValidProvinceId,
+  isValidUserRole,
   type AuditLoggerFn,
   type AuthTokenVerifier,
   type AuthenticatedRequest,
   type UserDirectoryReader
 } from './server/rbac';
+import {
+  createAdminChallengeStore,
+  evaluateCentralAdminEligibility,
+  hasFirebaseMfaClaim,
+  isRecentAuthentication,
+  parseMasterAdminEmails,
+  type AdminVerificationMethod
+} from './server/adminAuth';
 import { createFirestoreAuditLogger } from './server/audit';
 import { computeStructureCapacities, validateEstablishmentForHomologation } from './server/capacity';
 import { generatePnapOperationalBrief, isGeminiConfigured } from './server/geminiService';
+import {
+  StateMachineError,
+  addJudicialProcessTransactional,
+  admitInmateTransactional,
+  dispatchTransferTransactional,
+  extinguishJudicialProcessTransactional,
+  legalTransitionTransactional,
+  recaptureInmateTransactional,
+  receiveTransferTransactional,
+  registerExitTransactional,
+  registerTemporaryMovementTransactional,
+  resolveEffectiveCustodyState
+} from './server/stateMachine';
+import {
+  listHealthRecords,
+  listVisitorsFromFurs,
+  listVisitsFromFurs,
+  recordClinicalEvaluationTransactional,
+  redactInmateClinicalData,
+  registerIncidentAndSanctionTransactional,
+  registerVisitCheckInTransactional,
+  registerVisitorTransactional,
+  updateRehabilitationTransactional,
+  updateVisitorStatusTransactional,
+  upsertCatalogTransactional
+} from './server/sectoralModules';
+import {
+  searchNationalIndexInFirestore,
+  type SearchCategory,
+  type SearchCustodyScope
+} from './server/searchEngine';
 
 const VALID_EXIT_MODALITIES: readonly ExitModality[] = [
   'CUMPRIMENTO_PENA',
@@ -60,6 +106,9 @@ export interface ServerDependencies {
   checkFirestore: () => Promise<{ connected: boolean; collectionsCount?: number; error?: string }>;
   generateAiBrief: typeof generatePnapOperationalBrief;
   getAllowedOrigins: () => string[];
+  getMasterAdminEmails?: () => string[];
+  revokeUserRefreshTokens?: (uid: string) => Promise<void>;
+  lookupAuthUidByEmail?: (email: string) => Promise<string | null>;
 }
 
 export function parseAllowedOrigins(rawFrontendUrl = process.env.FRONTEND_URL): string[] {
@@ -97,15 +146,20 @@ function getDefaultDependencies(): ServerDependencies {
     writeAuditLog: createFirestoreAuditLogger(getDb),
     checkFirestore: () => checkFirestoreConnection(),
     generateAiBrief: generatePnapOperationalBrief,
-    getAllowedOrigins: () => parseAllowedOrigins()
+    getAllowedOrigins: () => parseAllowedOrigins(),
+    getMasterAdminEmails: () => parseMasterAdminEmails(),
+    revokeUserRefreshTokens: async (uid: string) => {
+      await getFirebaseAdminServices().auth.revokeRefreshTokens(uid);
+    },
+    lookupAuthUidByEmail: async (email: string) => {
+      try {
+        const rec = await getFirebaseAdminServices().auth.getUserByEmail(email);
+        return rec.uid;
+      } catch {
+        return null;
+      }
+    }
   };
-}
-
-function addMonthsIso(baseDateStr: string, monthsToAdd: number, fallbackDate: string): string {
-  const parsed = new Date(baseDateStr || fallbackDate);
-  if (Number.isNaN(parsed.getTime())) return fallbackDate;
-  parsed.setMonth(parsed.getMonth() + monthsToAdd);
-  return parsed.toISOString().split('T')[0];
 }
 
 function emptyProvinceStats(provinceId: ProvinceId): ProvinceStatistics {
@@ -124,6 +178,14 @@ function emptyProvinceStats(provinceId: ProvinceId): ProvinceStatistics {
 }
 
 function handleServerError(err: unknown, res: Response, fallbackMessage: string) {
+  if (err instanceof StateMachineError) {
+    res.status(err.statusCode).json({
+      error: err.code,
+      message: err.message,
+      ...(err.details ? { details: err.details } : {})
+    });
+    return;
+  }
   const message = err instanceof Error ? err.message : fallbackMessage;
   if (message === 'FIREBASE_ADMIN_NOT_CONFIGURED') {
     res.status(503).json({
@@ -279,6 +341,518 @@ export function createApp(customDeps?: Partial<ServerDependencies>) {
     res.status(status.connected ? 200 : 503).json(status);
   });
 
+  // --- PAINEL ADMINISTRATIVO (FASE 2: PORTA DE ENTRADA, GOVERNAÇÃO & SEGURANÇA) ---
+  const adminChallengeStore = createAdminChallengeStore();
+
+  app.post('/api/pnap/admin/challenge', requirePnapAuth, async (req: AuthenticatedRequest, res) => {
+    const user = req.pnapUser!;
+    const decoded = req.authToken!;
+    try {
+      const db = deps.getDb();
+      const eligibility = await evaluateCentralAdminEligibility({
+        db,
+        decoded,
+        pnapUser: user,
+        allowlist: deps.getMasterAdminEmails ? deps.getMasterAdminEmails() : parseMasterAdminEmails()
+      });
+
+      if (!eligibility.eligible) {
+        await logBlockedAttempt(
+          req,
+          user,
+          'BLOCKED_ADMIN_PANEL_CHALLENGE',
+          'pnap/admin/challenge',
+          `Acesso negado ao desafio administrativo (${eligibility.reasonCode}): ${eligibility.reasonMessage}`
+        );
+        res.status(403).json({
+          error: eligibility.reasonCode || 'FORBIDDEN',
+          message: eligibility.reasonMessage || 'Sem autorização para o Painel Administrativo.'
+        });
+        return;
+      }
+
+      const issued = adminChallengeStore.issue(decoded.uid, decoded.email!);
+      res.status(200).json({
+        challengeId: issued.challengeId,
+        challenge: issued.challenge,
+        expiresAt: new Date(issued.expiresAt).toISOString(),
+        uid: decoded.uid,
+        email: decoded.email,
+        isMasterAllowlisted: eligibility.isMasterAllowlisted,
+        hasAdminDoc: eligibility.hasAdminDoc,
+        hasMfaClaim: hasFirebaseMfaClaim(decoded),
+        recentAuthValid: isRecentAuthentication(decoded)
+      });
+    } catch (err) {
+      handleServerError(err, res, 'Erro ao gerar desafio de verificação administrativa.');
+    }
+  });
+
+  app.post('/api/pnap/admin/verify-access', requirePnapAuth, async (req: AuthenticatedRequest, res) => {
+    const user = req.pnapUser!;
+    const decoded = req.authToken!;
+    const challengeId = String(req.body?.challengeId || '').trim();
+    const verificationMethod = String(req.body?.verificationMethod || '').trim() as AdminVerificationMethod;
+    const credentialId = String(req.body?.credentialId || '').trim();
+
+    if (!challengeId) {
+      res.status(400).json({
+        error: 'MISSING_CHALLENGE_ID',
+        message: 'Identificador do desafio administrativo é obrigatório.'
+      });
+      return;
+    }
+
+    if (
+      verificationMethod !== 'REAUTH_GOOGLE' &&
+      verificationMethod !== 'WEBAUTHN_PASSKEY' &&
+      verificationMethod !== 'FIREBASE_MFA'
+    ) {
+      res.status(400).json({
+        error: 'INVALID_VERIFICATION_METHOD',
+        message: 'Método de segunda verificação individual inválido.'
+      });
+      return;
+    }
+
+    try {
+      const db = deps.getDb();
+      const eligibility = await evaluateCentralAdminEligibility({
+        db,
+        decoded,
+        pnapUser: user,
+        allowlist: deps.getMasterAdminEmails ? deps.getMasterAdminEmails() : parseMasterAdminEmails()
+      });
+
+      if (!eligibility.eligible) {
+        await logBlockedAttempt(
+          req,
+          user,
+          'BLOCKED_ADMIN_PANEL_ACCESS',
+          'pnap/admin/verify-access',
+          `Tentativa bloqueada de acesso ao Painel Administrativo (${eligibility.reasonCode}).`
+        );
+        res.status(403).json({
+          error: eligibility.reasonCode || 'FORBIDDEN',
+          message: eligibility.reasonMessage || 'Acesso negado ao Painel Administrativo.'
+        });
+        return;
+      }
+
+      const consumed = adminChallengeStore.consume(challengeId, decoded.uid);
+      if (!consumed.ok) {
+        await logBlockedAttempt(
+          req,
+          user,
+          'BLOCKED_ADMIN_CHALLENGE_INVALID',
+          'pnap/admin/verify-access',
+          consumed.message
+        );
+        res.status(401).json({ error: consumed.code, message: consumed.message });
+        return;
+      }
+
+      if (verificationMethod === 'WEBAUTHN_PASSKEY' && !credentialId) {
+        res.status(400).json({
+          error: 'MISSING_WEBAUTHN_CREDENTIAL',
+          message: 'Credencial de passkey individual não fornecida.'
+        });
+        return;
+      }
+
+      if (verificationMethod === 'FIREBASE_MFA' && !hasFirebaseMfaClaim(decoded)) {
+        res.status(403).json({
+          error: 'MFA_CLAIM_REQUIRED',
+          message: 'A sessão atual não contém segundo factor MFA validado pelo Firebase.'
+        });
+        return;
+      }
+
+      if (verificationMethod === 'REAUTH_GOOGLE' && !isRecentAuthentication(decoded)) {
+        res.status(401).json({
+          error: 'RECENT_REAUTH_REQUIRED',
+          message: 'Confirme novamente a conta Google institucional para completar a segunda verificação.'
+        });
+        return;
+      }
+
+      const verifiedAt = new Date().toISOString();
+      const expiresAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+
+      await deps.writeAuditLog({
+        userId: user.uid,
+        userName: user.profile.fullName,
+        userRole: user.assignments.role,
+        userScopeProvince: 'CENTRAL_GLOBAL',
+        action: 'ADMIN_PANEL_ACCESS_GRANTED',
+        targetResource: 'pnap/admin',
+        details: `Acesso ao Painel Administrativo concedido a ${decoded.email} via ${verificationMethod}.`,
+        ipAddress: extractClientIp(req),
+        jurisdictionStatus: 'AUTHORIZED'
+      });
+
+      res.status(200).json({
+        verified: true,
+        verifiedAt,
+        expiresAt,
+        verificationMethod,
+        admin: {
+          uid: decoded.uid,
+          email: decoded.email,
+          role: user.assignments.role,
+          isMasterAllowlisted: eligibility.isMasterAllowlisted,
+          hasAdminDoc: eligibility.hasAdminDoc
+        }
+      });
+    } catch (err) {
+      handleServerError(err, res, 'Erro ao validar acesso administrativo.');
+    }
+  });
+
+  app.get('/api/pnap/admin/overview', requirePnapAuth, async (req: AuthenticatedRequest, res) => {
+    const user = req.pnapUser!;
+    const decoded = req.authToken!;
+    try {
+      const db = deps.getDb();
+      const eligibility = await evaluateCentralAdminEligibility({
+        db,
+        decoded,
+        pnapUser: user,
+        allowlist: deps.getMasterAdminEmails ? deps.getMasterAdminEmails() : parseMasterAdminEmails()
+      });
+
+      if (!eligibility.eligible) {
+        await logBlockedAttempt(
+          req,
+          user,
+          'BLOCKED_ADMIN_OVERVIEW_READ',
+          'pnap/admin/overview',
+          'Tentativa não autorizada de leitura da visão administrativa nacional.'
+        );
+        res.status(403).json({
+          error: eligibility.reasonCode || 'FORBIDDEN',
+          message: eligibility.reasonMessage || 'Acesso restrito a CENTRAL_ADMIN autorizado.'
+        });
+        return;
+      }
+
+      const [statsSnap, estSnap, usersSnap, adminsSnap, auditSnap] = await Promise.all([
+        db.collection('pnap_province_stats').get(),
+        db.collection('pnap_establishments').get(),
+        db.collection('pnap_users').get(),
+        db.collection('pnap_admins').get(),
+        db.collection('pnap_audit_logs').get()
+      ]);
+
+      const statsByProvince: Record<string, ProvinceStatistics> = {};
+      let activeInmates = 0;
+      let totalCapacity = 0;
+      statsSnap.docs.forEach((doc) => {
+        const data = doc.data() as ProvinceStatistics;
+        statsByProvince[doc.id] = data;
+        activeInmates += Number(data.activeInmates) || 0;
+        totalCapacity += Number(data.totalCapacity) || 0;
+      });
+
+      const establishments = estSnap.docs.map((d) => d.data() as EstablishmentProfile);
+      const homologatedCount = establishments.filter((e) => e.provisioningStatus === 'HOMOLOGATED').length;
+      const draftCount = establishments.filter((e) => e.provisioningStatus !== 'HOMOLOGATED').length;
+      const users = usersSnap.docs.map((d) => d.data() as PnapUser);
+      const admins = adminsSnap.docs.map((d) => d.data() as Record<string, unknown>);
+      const recentAuditLogs = auditSnap.docs
+        .map((d) => d.data() as AuditLogEvent)
+        .sort((a, b) => b.timestamp.localeCompare(a.timestamp))
+        .slice(0, 20);
+
+      const occupancyRate = totalCapacity > 0 ? Math.round((activeInmates / totalCapacity) * 100) : null;
+
+      res.status(200).json({
+        generatedAt: new Date().toISOString(),
+        metrics: {
+          provincesConfigured: Object.keys(statsByProvince).length,
+          totalProvinces: RDPA_2024_PROVINCES.length,
+          establishmentsCount: establishments.length,
+          homologatedCount,
+          draftCount,
+          activeInmates,
+          totalCapacity,
+          occupancyRate,
+          usersCount: users.length,
+          activeUsersCount: users.filter((u) => u.profile?.status === 'active').length,
+          adminsCount: admins.length
+        },
+        statsByProvince,
+        establishments,
+        users,
+        admins,
+        recentAuditLogs,
+        systemInfo: {
+          dpaVersion: 'RDPA 2024 · 21 Províncias',
+          firebaseAdminConfigured: getFirebaseAdminEnvStatus().configured,
+          databaseId: getFirebaseAdminEnvStatus().databaseId,
+          geminiConfigured: isGeminiConfigured(),
+          masterAllowlistCount: (deps.getMasterAdminEmails
+            ? deps.getMasterAdminEmails()
+            : parseMasterAdminEmails()
+          ).length
+        }
+      });
+    } catch (err) {
+      handleServerError(err, res, 'Erro ao carregar indicadores reais do Painel Administrativo.');
+    }
+  });
+
+  app.post('/api/pnap/admin/users', requirePnapAuth, async (req: AuthenticatedRequest, res) => {
+    const user = req.pnapUser!;
+    const decoded = req.authToken!;
+    try {
+      const db = deps.getDb();
+      const eligibility = await evaluateCentralAdminEligibility({
+        db,
+        decoded,
+        pnapUser: user,
+        allowlist: deps.getMasterAdminEmails ? deps.getMasterAdminEmails() : parseMasterAdminEmails()
+      });
+
+      if (!eligibility.eligible) {
+        await logBlockedAttempt(
+          req,
+          user,
+          'BLOCKED_ADMIN_USER_PROVISION',
+          'pnap/admin/users',
+          'Tentativa não autorizada de provisionar utilizador PNAP.'
+        );
+        res.status(403).json({
+          error: eligibility.reasonCode || 'FORBIDDEN',
+          message: eligibility.reasonMessage || 'Apenas CENTRAL_ADMIN autorizado pode gerir utilizadores.'
+        });
+        return;
+      }
+
+      const fullName = String(req.body?.fullName || '').trim();
+      const email = String(req.body?.email || '').trim().toLowerCase();
+      const badgeNumber = String(req.body?.badgeNumber || '').trim() || 'PNAP-CIP';
+      const rank = String(req.body?.rank || '').trim() || 'Oficial Prisional';
+      const phone = String(req.body?.phone || '').trim();
+      const role = req.body?.role;
+      const assignedProvinceId = String(req.body?.assignedProvinceId || '').trim();
+      const assignedEstablishmentId = String(req.body?.assignedEstablishmentId || '').trim();
+
+      if (!fullName || !email) {
+        res.status(400).json({ error: 'INVALID_USER_PAYLOAD', message: 'Nome completo e e-mail são obrigatórios.' });
+        return;
+      }
+      if (!isValidUserRole(role)) {
+        res.status(400).json({ error: 'INVALID_ROLE', message: 'Função RBAC inválida.' });
+        return;
+      }
+      if (
+        assignedProvinceId !== 'all' &&
+        !isValidProvinceId(assignedProvinceId)
+      ) {
+        res.status(400).json({ error: 'INVALID_PROVINCE', message: 'Província atribuída inválida (RDPA 2024).' });
+        return;
+      }
+      if (assignedProvinceId === 'all' && role !== 'CENTRAL_ADMIN' && role !== 'AUDITOR_INSPECTOR') {
+        res.status(400).json({
+          error: 'INVALID_GLOBAL_SCOPE',
+          message: 'Apenas CENTRAL_ADMIN ou AUDITOR_INSPECTOR nacional podem ter escopo all.'
+        });
+        return;
+      }
+
+      let targetUid = String(req.body?.uid || '').trim();
+      if (!targetUid && deps.lookupAuthUidByEmail) {
+        targetUid = (await deps.lookupAuthUidByEmail(email)) || '';
+      }
+      if (!targetUid) {
+        res.status(400).json({
+          error: 'USER_UID_REQUIRED',
+          message: 'Informe o UID Firebase do utilizador ou garanta que a conta Google já exista no Firebase Authentication.'
+        });
+        return;
+      }
+
+      const pnapUserDoc: PnapUser = {
+        uid: targetUid,
+        profile: {
+          uid: targetUid,
+          fullName,
+          badgeNumber,
+          rank,
+          phone,
+          email,
+          status: 'active'
+        },
+        assignments: {
+          role,
+          assignedProvinceId,
+          ...(assignedEstablishmentId ? { assignedEstablishmentId } : {}),
+          permissions: Array.isArray(req.body?.permissions) ? req.body.permissions : []
+        }
+      };
+
+      await db.collection('pnap_users').doc(targetUid).set(pnapUserDoc);
+
+      await deps.writeAuditLog({
+        userId: user.uid,
+        userName: user.profile.fullName,
+        userRole: user.assignments.role,
+        userScopeProvince: 'CENTRAL_GLOBAL',
+        action: 'ADMIN_USER_PROVISIONED',
+        targetResource: `pnap/users/${targetUid}`,
+        details: `Utilizador ${fullName} (${email}) atribuído com perfil ${role} · ${assignedProvinceId}.`,
+        ipAddress: extractClientIp(req),
+        jurisdictionStatus: 'AUTHORIZED'
+      });
+
+      res.status(200).json({ success: true, user: pnapUserDoc });
+    } catch (err) {
+      handleServerError(err, res, 'Erro ao guardar conta de utilizador PNAP.');
+    }
+  });
+
+  app.patch('/api/pnap/admin/users/:uid/status', requirePnapAuth, async (req: AuthenticatedRequest, res) => {
+    const user = req.pnapUser!;
+    const decoded = req.authToken!;
+    const targetUid = String(req.params.uid || '').trim();
+    const nextStatus = req.body?.status === 'suspended' ? 'suspended' : req.body?.status === 'active' ? 'active' : null;
+
+    if (!targetUid || !nextStatus) {
+      res.status(400).json({ error: 'INVALID_STATUS_PAYLOAD', message: 'UID e estado (active/suspended) são obrigatórios.' });
+      return;
+    }
+
+    try {
+      const db = deps.getDb();
+      const eligibility = await evaluateCentralAdminEligibility({
+        db,
+        decoded,
+        pnapUser: user,
+        allowlist: deps.getMasterAdminEmails ? deps.getMasterAdminEmails() : parseMasterAdminEmails()
+      });
+
+      if (!eligibility.eligible) {
+        await logBlockedAttempt(
+          req,
+          user,
+          'BLOCKED_ADMIN_USER_STATUS',
+          `pnap/users/${targetUid}`,
+          'Tentativa não autorizada de suspender/reactivar utilizador.'
+        );
+        res.status(403).json({
+          error: eligibility.reasonCode || 'FORBIDDEN',
+          message: eligibility.reasonMessage || 'Acesso negado.'
+        });
+        return;
+      }
+
+      if (targetUid === user.uid && nextStatus === 'suspended') {
+        res.status(400).json({
+          error: 'SELF_SUSPENSION_BLOCKED',
+          message: 'O administrador autenticado não pode suspender a própria sessão ativa.'
+        });
+        return;
+      }
+
+      const ref = db.collection('pnap_users').doc(targetUid);
+      const snap = await ref.get();
+      if (!snap.exists) {
+        res.status(404).json({ error: 'USER_NOT_FOUND', message: 'Utilizador não encontrado em pnap_users.' });
+        return;
+      }
+
+      const existing = snap.data() as PnapUser;
+      const updated: PnapUser = {
+        ...existing,
+        profile: {
+          ...existing.profile,
+          status: nextStatus
+        }
+      };
+
+      await ref.set(updated);
+      if (nextStatus === 'suspended' && deps.revokeUserRefreshTokens) {
+        await deps.revokeUserRefreshTokens(targetUid).catch(() => undefined);
+      }
+
+      await deps.writeAuditLog({
+        userId: user.uid,
+        userName: user.profile.fullName,
+        userRole: user.assignments.role,
+        userScopeProvince: 'CENTRAL_GLOBAL',
+        action: nextStatus === 'suspended' ? 'ADMIN_USER_SUSPENDED' : 'ADMIN_USER_REACTIVATED',
+        targetResource: `pnap/users/${targetUid}`,
+        details: `Estado da conta ${existing.profile?.email || targetUid} alterado para ${nextStatus}.`,
+        ipAddress: extractClientIp(req),
+        jurisdictionStatus: 'AUTHORIZED'
+      });
+
+      res.status(200).json({ success: true, user: updated });
+    } catch (err) {
+      handleServerError(err, res, 'Erro ao atualizar estado do utilizador.');
+    }
+  });
+
+  app.post('/api/pnap/admin/sessions/:uid/revoke', requirePnapAuth, async (req: AuthenticatedRequest, res) => {
+    const user = req.pnapUser!;
+    const decoded = req.authToken!;
+    const targetUid = String(req.params.uid || '').trim();
+    if (!targetUid) {
+      res.status(400).json({ error: 'MISSING_UID', message: 'UID do utilizador é obrigatório.' });
+      return;
+    }
+
+    try {
+      const db = deps.getDb();
+      const eligibility = await evaluateCentralAdminEligibility({
+        db,
+        decoded,
+        pnapUser: user,
+        allowlist: deps.getMasterAdminEmails ? deps.getMasterAdminEmails() : parseMasterAdminEmails()
+      });
+
+      if (!eligibility.eligible) {
+        await logBlockedAttempt(
+          req,
+          user,
+          'BLOCKED_SESSION_REVOKE',
+          `pnap/admin/sessions/${targetUid}`,
+          'Tentativa não autorizada de revogação de sessões.'
+        );
+        res.status(403).json({
+          error: eligibility.reasonCode || 'FORBIDDEN',
+          message: eligibility.reasonMessage || 'Acesso negado.'
+        });
+        return;
+      }
+
+      if (deps.revokeUserRefreshTokens) {
+        await deps.revokeUserRefreshTokens(targetUid);
+      }
+
+      await deps.writeAuditLog({
+        userId: user.uid,
+        userName: user.profile.fullName,
+        userRole: user.assignments.role,
+        userScopeProvince: 'CENTRAL_GLOBAL',
+        action: 'ADMIN_USER_SESSIONS_REVOKED',
+        targetResource: `pnap/sessions/${targetUid}`,
+        details: `Tokens de sessão Firebase revogados para ${targetUid}.`,
+        ipAddress: extractClientIp(req),
+        jurisdictionStatus: 'AUTHORIZED'
+      });
+
+      res.status(200).json({
+        success: true,
+        revokedUid: targetUid,
+        revokedAt: new Date().toISOString()
+      });
+    } catch (err) {
+      handleServerError(err, res, 'Erro ao revogar sessões do utilizador.');
+    }
+  });
+
   // --- ESTATÍSTICAS PROVINCIAIS (RDPA 2024) ---
   app.get('/api/pnap/provinces/stats', requirePnapAuth, async (req: AuthenticatedRequest, res) => {
     const user = req.pnapUser!;
@@ -346,8 +920,9 @@ export function createApp(customDeps?: Partial<ServerDependencies>) {
 
         let establishments = snap.docs.map((doc) => doc.data() as EstablishmentProfile);
         if (
-          (user.assignments.role === 'ESTABLISHMENT_DIRECTOR' ||
-            user.assignments.role === 'OPERATIONAL_OFFICER') &&
+          user.assignments.role !== 'CENTRAL_ADMIN' &&
+          user.assignments.role !== 'PROVINCIAL_COMMAND' &&
+          user.assignments.role !== 'AUDITOR_INSPECTOR' &&
           user.assignments.assignedEstablishmentId
         ) {
           establishments = establishments.filter(
@@ -557,29 +1132,36 @@ export function createApp(customDeps?: Partial<ServerDependencies>) {
     }
   );
 
-  // --- ÍNDICE NACIONAL DE RECLUSOS & LISTAGEM PROVINCIAL ---
-  app.get('/api/pnap/inmates/national-index', requirePnapAuth, async (req: AuthenticatedRequest, res) => {
+  // --- ÍNDICE NACIONAL DE RECLUSOS & CONSULTA INTELIGENTE ---
+  async function handleNationalIndexSearch(req: AuthenticatedRequest, res: Response) {
     const user = req.pnapUser!;
     const queryProvince = typeof req.query.provinceId === 'string' ? req.query.provinceId.trim() : '';
+    const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    const category = (typeof req.query.category === 'string' ? req.query.category.trim() : 'all') as SearchCategory;
+    const custodyScope = (typeof req.query.custodyScope === 'string' ? req.query.custodyScope.trim() : 'ALL') as SearchCustodyScope;
+    const rawLimit = typeof req.query.limit === 'string' ? Number(req.query.limit) : 50;
+    const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(100, Math.floor(rawLimit)) : 50;
 
-    if (queryProvince && !isValidProvinceId(queryProvince)) {
+    if (queryProvince && queryProvince !== 'all' && !isValidProvinceId(queryProvince)) {
       res.status(400).json({ error: 'INVALID_PROVINCE', message: 'Província de pesquisa inválida.' });
       return;
     }
 
     try {
       const db = deps.getDb();
-      let snap;
-      if (queryProvince) {
-        snap = await db
-          .collection('pnap_national_inmate_index')
-          .where('provinceId', '==', queryProvince)
-          .get();
-      } else {
-        snap = await db.collection('pnap_national_inmate_index').get();
-      }
+      const preferredProvinceId =
+        isValidProvinceId(user.assignments.assignedProvinceId)
+          ? user.assignments.assignedProvinceId
+          : undefined;
 
-      const items = snap.docs.map((d) => d.data() as NationalInmateIndexItem);
+      const searched = await searchNationalIndexInFirestore(db, {
+        q,
+        category,
+        custodyScope,
+        provinceId: (queryProvince || '') as ProvinceId | '' | 'all',
+        preferredProvinceId,
+        limit
+      });
 
       const isCrossProvince =
         user.assignments.role !== 'CENTRAL_ADMIN' &&
@@ -595,17 +1177,125 @@ export function createApp(customDeps?: Partial<ServerDependencies>) {
           targetResource: queryProvince
             ? `pnap/nationalInmateIndex/${queryProvince}`
             : 'pnap/nationalInmateIndex',
-          details: `Consulta federada ao Índice Nacional por utilizador de ${user.assignments.assignedProvinceId.toUpperCase()}.`,
+          details: `Consulta federada ao Índice Nacional${q ? ` (termo "${q}")` : ''} por utilizador de ${user.assignments.assignedProvinceId.toUpperCase()}.`,
           ipAddress: extractClientIp(req),
           jurisdictionStatus: 'CROSS_PROVINCE_QUERY'
         });
       }
 
-      res.status(200).json({ items });
+      res.status(200).json({
+        query: q,
+        total: searched.total,
+        results: searched.results,
+        items: searched.results
+      });
     } catch (err) {
       handleServerError(err, res, 'Erro ao consultar o Índice Nacional de Reclusos.');
     }
-  });
+  }
+
+  app.get('/api/pnap/national-index/search', requirePnapAuth, handleNationalIndexSearch);
+  app.get('/api/pnap/inmates/national-index', requirePnapAuth, handleNationalIndexSearch);
+
+  app.get(
+    '/api/pnap/inmates/:inmateId',
+    requirePnapAuth,
+    async (req: AuthenticatedRequest, res) => {
+      const user = req.pnapUser!;
+      const inmateId = String(req.params.inmateId || '').trim();
+      const mode = req.query.mode === 'reentry' ? 'reentry' : 'default';
+
+      if (!inmateId) {
+        res.status(400).json({ error: 'INVALID_INMATE_ID', message: 'ID da FUR inválido.' });
+        return;
+      }
+
+      try {
+        const db = deps.getDb();
+        const snap = await db.collection('pnap_inmates').doc(inmateId).get();
+        if (!snap.exists) {
+          res.status(404).json({ error: 'INMATE_NOT_FOUND', message: 'Ficha Única do recluso não encontrada.' });
+          return;
+        }
+
+        const inmate = snap.data() as Inmate;
+        const custodyState = resolveEffectiveCustodyState(inmate);
+
+        if (mode === 'reentry') {
+          const canRehydrateByRole = [
+            'CENTRAL_ADMIN',
+            'PROVINCIAL_COMMAND',
+            'ESTABLISHMENT_DIRECTOR',
+            'OPERATIONAL_OFFICER',
+            'PENAL_CONTROL'
+          ].includes(user.assignments.role);
+
+          if (!canRehydrateByRole || (custodyState !== 'LIBERTADO' && custodyState !== 'EVADIDO')) {
+            await logBlockedAttempt(
+              req,
+              user,
+              'BLOCKED_FUR_REENTRY_READ',
+              `pnap/inmates/${inmateId}`,
+              `Tentativa bloqueada de reidratação da FUR (${custodyState}) por ${user.assignments.role}.`
+            );
+            res.status(403).json({
+              error: 'FORBIDDEN',
+              message: 'Acesso Negado: Reidratação de FUR reservada a reentrada (LIBERTADO) ou recaptura (EVADIDO) por perfil de Controlo Penal.'
+            });
+            return;
+          }
+
+          if (
+            user.assignments.role !== 'CENTRAL_ADMIN' &&
+            user.assignments.assignedProvinceId !== inmate.provinceId
+          ) {
+            await deps.writeAuditLog({
+              userId: user.uid,
+              userName: user.profile.fullName,
+              userRole: user.assignments.role,
+              userScopeProvince: user.assignments.assignedProvinceId,
+              action: 'CROSS_PROVINCE_FUR_REHYDRATE',
+              targetResource: `pnap/inmates/${inmateId}`,
+              details: `Pré-carregamento interprovincial da FUR ${inmate.profile.matricula} (${custodyState}) para reentrada/recaptura em ${user.assignments.assignedProvinceId.toUpperCase()}.`,
+              ipAddress: extractClientIp(req),
+              jurisdictionStatus: 'CROSS_PROVINCE_QUERY'
+            });
+          }
+
+          res.status(200).json({
+            inmate: redactInmateClinicalData(inmate, 'PENAL_CONTROL')
+          });
+          return;
+        }
+
+        const canRead =
+          user.assignments.role === 'AUDITOR_INSPECTOR'
+            ? canOperateProvince(user, inmate.provinceId)
+            : canOperateEstablishment(user, inmate.provinceId, inmate.establishmentId);
+
+        if (!canRead) {
+          await logBlockedAttempt(
+            req,
+            user,
+            'BLOCKED_INMATE_FUR_READ',
+            `pnap/inmates/${inmateId}`,
+            `Tentativa bloqueada de leitura da FUR fora da jurisdição.`
+          );
+          res.status(403).json({
+            error: 'FORBIDDEN',
+            message: 'Sem jurisdição territorial para consultar esta Ficha Única.'
+          });
+          return;
+        }
+
+        res.status(200).json({
+          inmate: redactInmateClinicalData(inmate, user.assignments.role)
+        });
+      } catch (err) {
+        handleServerError(err, res, 'Erro ao carregar Ficha Única do recluso.');
+      }
+    }
+  );
 
   app.get(
     '/api/pnap/provinces/:provinceId/inmates',
@@ -643,8 +1333,9 @@ export function createApp(customDeps?: Partial<ServerDependencies>) {
 
         let inmates = snap.docs.map((d) => d.data() as Inmate);
         if (
-          (user.assignments.role === 'ESTABLISHMENT_DIRECTOR' ||
-            user.assignments.role === 'OPERATIONAL_OFFICER') &&
+          user.assignments.role !== 'CENTRAL_ADMIN' &&
+          user.assignments.role !== 'PROVINCIAL_COMMAND' &&
+          user.assignments.role !== 'AUDITOR_INSPECTOR' &&
           user.assignments.assignedEstablishmentId
         ) {
           inmates = inmates.filter(
@@ -652,6 +1343,7 @@ export function createApp(customDeps?: Partial<ServerDependencies>) {
           );
         }
 
+        inmates = inmates.map((inm) => redactInmateClinicalData(inm, user.assignments.role));
         res.status(200).json({ provinceId, inmates });
       } catch (err) {
         handleServerError(err, res, 'Erro ao listar reclusos da província.');
@@ -659,10 +1351,10 @@ export function createApp(customDeps?: Partial<ServerDependencies>) {
     }
   );
 
-  // --- ENTRADA / INTERNAMENTO DE RECLUSO ---
+  // --- ENTRADA / INTERNAMENTO TRANSACIONAL (UNICIDADE NACIONAL + VERSÃO) ---
   app.post('/api/pnap/inmates/admission', requirePnapAuth, async (req: AuthenticatedRequest, res) => {
     const user = req.pnapUser!;
-    const inmatePayload = req.body as Partial<Inmate> | undefined;
+    const inmatePayload = req.body as (Partial<Inmate> & { reentry?: boolean }) | undefined;
 
     const provinceId = inmatePayload?.provinceId;
     const establishmentId = inmatePayload?.establishmentId?.trim() || '';
@@ -675,17 +1367,17 @@ export function createApp(customDeps?: Partial<ServerDependencies>) {
       return;
     }
 
-    if (!canOperateEstablishment(user, provinceId, establishmentId)) {
+    if (!canManagePenalControl(user, provinceId, establishmentId)) {
       await logBlockedAttempt(
         req,
         user,
         'BLOCKED_INMATE_ADMISSION_ATTEMPT',
         `pnap/provinces/${provinceId}/establishments/${establishmentId}/inmates`,
-        `Tentativa bloqueada de internamento fora da jurisdição autorizada (${provinceId.toUpperCase()} / ${establishmentId}).`
+        `Tentativa bloqueada de internamento fora da jurisdição ou perfil não autorizado (${provinceId.toUpperCase()} / ${establishmentId}).`
       );
       res.status(403).json({
         error: 'FORBIDDEN',
-        message: `Acesso Negado: Sem competência territorial para admitir reclusos em ${provinceId.toUpperCase()}.`
+        message: `Acesso Negado: Sem competência de Controlo Penal para admitir reclusos em ${provinceId.toUpperCase()}.`
       });
       return;
     }
@@ -699,136 +1391,23 @@ export function createApp(customDeps?: Partial<ServerDependencies>) {
     }
 
     try {
-      const db = deps.getDb();
-      const estRef = db.collection('pnap_establishments').doc(establishmentId);
-      const estSnap = await estRef.get();
-      if (!estSnap.exists) {
-        res.status(404).json({
-          error: 'ESTABLISHMENT_NOT_FOUND',
-          message: 'Estabelecimento de destino não encontrado.'
-        });
-        return;
-      }
-
-      const establishment = estSnap.data() as EstablishmentProfile;
-      if (establishment.provinceId !== provinceId || establishment.provisioningStatus !== 'HOMOLOGATED') {
-        res.status(400).json({
-          error: 'ESTABLISHMENT_NOT_HOMOLOGATED',
-          message: 'Estabelecimento deve pertencer à província indicada e estar HOMOLOGATED.'
-        });
-        return;
-      }
-
-      const inmateId = inmatePayload.inmateId?.trim() || `inm-${provinceId}-${Date.now()}`;
-      const nowIso = new Date().toISOString();
-
-      const newInmate: Inmate = {
-        ...(inmatePayload as Inmate),
-        inmateId,
-        provinceId,
-        establishmentId,
-        currentStatus: 'ATIVO',
-        admission: {
-          ...inmatePayload.admission!,
-          admissionId: inmatePayload.admission?.admissionId || `adm-${Date.now()}`,
-          intakeOfficer: user.profile.fullName
-        }
-      };
-
-      const indexItem: NationalInmateIndexItem = {
-        inmateId,
-        matricula: newInmate.profile.matricula,
-        fullName: newInmate.profile.fullName,
-        alias: newInmate.profile.alias,
-        biNumber: newInmate.profile.biNumber,
-        provinceId,
-        provinceName: provinceId.toUpperCase(),
-        establishmentId,
-        establishmentName: establishment.name,
-        pavilionName: newInmate.pavilionId,
-        cellCode: newInmate.cellId,
-        legalStatus: newInmate.legal.legalStatus,
-        crimeCategory: newInmate.legal.crimeCategory,
-        penalCodeArticle: newInmate.legal.penalCodeArticle,
-        parentName: newInmate.profile.fatherName || newInmate.profile.motherName || '',
-        emergencyContactName: newInmate.profile.emergencyContact?.name || '',
-        emergencyPhone: newInmate.profile.emergencyContact?.phone || '',
-        neighborhood: newInmate.profile.neighborhood || '',
-        photoUrl: newInmate.profile.photoUrl || '',
-        lastUpdated: nowIso,
-        custodyStatus: 'ATIVO'
-      };
-
-      const admissionRecord: AdmissionRecord = {
-        admissionId: newInmate.admission.admissionId,
-        inmateId,
-        fullName: newInmate.profile.fullName,
-        matricula: newInmate.profile.matricula,
-        provinceId,
-        establishmentId,
-        courtName: newInmate.admission.courtName,
-        crime: newInmate.legal.crimeCategory,
-        timestamp: nowIso,
-        registeredBy: user.profile.fullName
-      };
-
-      await db.collection('pnap_inmates').doc(inmateId).set(newInmate);
-      await db.collection('pnap_national_inmate_index').doc(inmateId).set(indexItem);
-      await db.collection('pnap_admissions').doc(admissionRecord.admissionId).set(admissionRecord);
-
-      // Atualizar ocupação da unidade e estatísticas provinciais
-      const nextUnitActive = (Number(establishment.activeInmatesCount) || 0) + 1;
-      await estRef.set({ ...establishment, activeInmatesCount: nextUnitActive });
-
-      const statsRef = db.collection('pnap_province_stats').doc(provinceId);
-      const statsSnap = await statsRef.get();
-      const prevStats = statsSnap.exists
-        ? (statsSnap.data() as ProvinceStatistics)
-        : emptyProvinceStats(provinceId);
-
-      const nextActive = prevStats.activeInmates + 1;
-      const totalCap = prevStats.totalCapacity;
-      const isPreventive =
-        newInmate.legal.legalStatus === 'PREVENTIVO' || newInmate.legal.legalStatus === 'RECORRENTE';
-
-      const updatedStats: ProvinceStatistics = {
-        ...prevStats,
-        activeInmates: nextActive,
-        availableSpots: Math.max(0, totalCap - nextActive),
-        occupancyRate: totalCap > 0 ? Number(((nextActive / totalCap) * 100).toFixed(1)) : 0,
-        preventiveCount: isPreventive ? prevStats.preventiveCount + 1 : prevStats.preventiveCount,
-        convictedCount: !isPreventive ? prevStats.convictedCount + 1 : prevStats.convictedCount,
-        maleCount: newInmate.profile.gender === 'M' ? prevStats.maleCount + 1 : prevStats.maleCount,
-        femaleCount: newInmate.profile.gender === 'F' ? prevStats.femaleCount + 1 : prevStats.femaleCount
-      };
-      await statsRef.set(updatedStats);
-
-      await deps.writeAuditLog({
-        userId: user.uid,
-        userName: user.profile.fullName,
-        userRole: user.assignments.role,
-        userScopeProvince:
-          user.assignments.role === 'CENTRAL_ADMIN'
-            ? 'CENTRAL_GLOBAL'
-            : user.assignments.assignedProvinceId,
-        action: 'INMATE_ADMISSION_REGISTERED',
-        targetResource: `pnap/provinces/${provinceId}/establishments/${establishmentId}/inmates/${inmateId}`,
-        details: `Internamento registado: ${newInmate.profile.fullName} (${newInmate.profile.matricula}) em ${establishment.name}. Oficial: ${user.profile.fullName}.`,
-        ipAddress: extractClientIp(req),
-        jurisdictionStatus: 'AUTHORIZED'
-      });
-
+      const result = await admitInmateTransactional(
+        deps.getDb(),
+        { user, ipAddress: extractClientIp(req) },
+        inmatePayload
+      );
       res.status(201).json({
         success: true,
-        inmate: newInmate,
-        admission: admissionRecord
+        inmate: result.inmate,
+        admission: result.admission,
+        process: result.process
       });
     } catch (err) {
       handleServerError(err, res, 'Erro ao registar internamento.');
     }
   });
 
-  // --- SAÍDAS E MODALIDADES (8 MODALIDADES INCLUINDO TRANSFERENCIA) ---
+  // --- SAÍDAS RIGOROSAS & DESPACHO DE TRANSFERÊNCIA (8 MODALIDADES) ---
   app.post('/api/pnap/inmates/:inmateId/exit', requirePnapAuth, async (req: AuthenticatedRequest, res) => {
     const user = req.pnapUser!;
     const inmateId = String(req.params.inmateId || '').trim();
@@ -839,7 +1418,10 @@ export function createApp(customDeps?: Partial<ServerDependencies>) {
       exitDate,
       destinationProvinceId,
       destinationEstablishmentId,
-      notes
+      notes,
+      approvedByDirector,
+      extinguishProcessId,
+      expectedVersion
     } = req.body || {};
 
     if (!inmateId || !VALID_EXIT_MODALITIES.includes(modality)) {
@@ -862,21 +1444,9 @@ export function createApp(customDeps?: Partial<ServerDependencies>) {
       return;
     }
 
-    if (
-      modality === 'TRANSFERENCIA' &&
-      (!isValidProvinceId(destinationProvinceId) || !String(destinationEstablishmentId || '').trim())
-    ) {
-      res.status(400).json({
-        error: 'MISSING_TRANSFER_DESTINATION',
-        message: 'Indique província e estabelecimento de destino válidos para transferência.'
-      });
-      return;
-    }
-
     try {
       const db = deps.getDb();
-      const inmateRef = db.collection('pnap_inmates').doc(inmateId);
-      const inmateSnap = await inmateRef.get();
+      const inmateSnap = await db.collection('pnap_inmates').doc(inmateId).get();
       if (!inmateSnap.exists) {
         res.status(404).json({
           error: 'INMATE_NOT_FOUND',
@@ -886,190 +1456,56 @@ export function createApp(customDeps?: Partial<ServerDependencies>) {
       }
 
       const inmate = inmateSnap.data() as Inmate;
-
-      if (!canOperateEstablishment(user, inmate.provinceId, inmate.establishmentId)) {
+      if (!canManagePenalControl(user, inmate.provinceId, inmate.establishmentId)) {
         await logBlockedAttempt(
           req,
           user,
           'BLOCKED_INMATE_EXIT_ATTEMPT',
           `pnap/provinces/${inmate.provinceId}/establishments/${inmate.establishmentId}/inmates/${inmateId}`,
-          `Tentativa bloqueada de saída (${modality}) para ${inmate.profile.fullName} fora da jurisdição.`
+          `Tentativa bloqueada de saída (${modality}) para ${inmate.profile.fullName} fora da jurisdição ou competência.`
         );
         res.status(403).json({
           error: 'FORBIDDEN',
-          message: `Acesso Negado: Sem competência para registar saída na província ${inmate.provinceId.toUpperCase()}.`
+          message: `Acesso Negado: Sem competência de Controlo Penal para registar saída em ${inmate.provinceId.toUpperCase()}.`
         });
         return;
       }
 
-      const existingReleaseSnap = await db
-        .collection('pnap_releases')
-        .where('inmateId', '==', inmateId)
-        .get();
+      const parsedExpectedVersion =
+        expectedVersion !== undefined ? Number(expectedVersion) : undefined;
 
-      if (inmate.currentStatus !== 'ATIVO' || !existingReleaseSnap.empty) {
-        res.status(409).json({
-          error: 'DUPLICATE_EXIT_BLOCKED',
-          message: `Saída duplicada bloqueada: ${inmate.profile.fullName} já possui estado ${inmate.currentStatus}.`
-        });
-        return;
-      }
-
-      const resultingStatus: 'LIBERTADO' | 'FALECIDO' | 'EVADIDO' | 'TRANSFERIDO' =
-        modality === 'OBITO'
-          ? 'FALECIDO'
-          : modality === 'EVASAO'
-          ? 'EVADIDO'
-          : modality === 'TRANSFERENCIA'
-          ? 'TRANSFERIDO'
-          : 'LIBERTADO';
-
-      const nowIso = new Date().toISOString();
-
-      await inmateRef.set({ ...inmate, currentStatus: resultingStatus });
-
-      const indexRef = db.collection('pnap_national_inmate_index').doc(inmateId);
-      const indexSnap = await indexRef.get();
-      if (indexSnap.exists) {
-        const indexData = indexSnap.data() as NationalInmateIndexItem;
-        await indexRef.set({
-          ...indexData,
-          custodyStatus: resultingStatus,
-          lastUpdated: nowIso
-        });
-      }
-
-      // Atualizar ocupação do estabelecimento sem alterar totalCapacity
-      const estRef = db.collection('pnap_establishments').doc(inmate.establishmentId);
-      const estSnap = await estRef.get();
-      let unitLabel = inmate.establishmentId;
-      if (estSnap.exists) {
-        const est = estSnap.data() as EstablishmentProfile;
-        unitLabel = `${est.name} (${est.establishmentId})`;
-        const nextPavilions = est.pavilions?.map((pav) => ({
-          ...pav,
-          blocks: pav.blocks.map((blk) => ({
-            ...blk,
-            cells: blk.cells.map((cell) => {
-              if (cell.cellId === inmate.cellId || cell.inmateIds.includes(inmateId)) {
-                return {
-                  ...cell,
-                  inmateIds: cell.inmateIds.filter((id) => id !== inmateId),
-                  currentOccupants: Math.max(0, cell.currentOccupants - 1)
-                };
-              }
-              return cell;
-            })
-          }))
-        }));
-
-        await estRef.set({
-          ...est,
-          activeInmatesCount: Math.max(0, (Number(est.activeInmatesCount) || 0) - 1),
-          ...(nextPavilions ? { pavilions: nextPavilions } : {})
-        });
-      }
-
-      // Atualizar estatísticas provinciais sem alterar totalCapacity
-      const statsRef = db.collection('pnap_province_stats').doc(inmate.provinceId);
-      const statsSnap = await statsRef.get();
-      const prevStats = statsSnap.exists
-        ? (statsSnap.data() as ProvinceStatistics)
-        : emptyProvinceStats(inmate.provinceId);
-      const nextActive = Math.max(0, prevStats.activeInmates - 1);
-      const totalCap = prevStats.totalCapacity;
-      const isPreventive =
-        inmate.legal.legalStatus === 'PREVENTIVO' || inmate.legal.legalStatus === 'RECORRENTE';
-
-      await statsRef.set({
-        ...prevStats,
-        activeInmates: nextActive,
-        availableSpots: Math.max(0, totalCap - nextActive),
-        occupancyRate: totalCap > 0 ? Number(((nextActive / totalCap) * 100).toFixed(1)) : 0,
-        preventiveCount: isPreventive
-          ? Math.max(0, prevStats.preventiveCount - 1)
-          : prevStats.preventiveCount,
-        convictedCount: !isPreventive
-          ? Math.max(0, prevStats.convictedCount - 1)
-          : prevStats.convictedCount,
-        maleCount:
-          inmate.profile.gender === 'M' ? Math.max(0, prevStats.maleCount - 1) : prevStats.maleCount,
-        femaleCount:
-          inmate.profile.gender === 'F'
-            ? Math.max(0, prevStats.femaleCount - 1)
-            : prevStats.femaleCount
-      });
-
-      const releaseRecord: ReleaseRecord = {
-        releaseId: `rel-${Date.now()}`,
+      const result = await registerExitTransactional(
+        db,
+        { user, ipAddress: extractClientIp(req) },
         inmateId,
-        fullName: inmate.profile.fullName,
-        matricula: inmate.profile.matricula,
-        provinceId: inmate.provinceId,
-        establishmentId: inmate.establishmentId,
-        alvaraNumber: String(documentNumber).trim(),
-        judgeName: String(authorityOrDetail).trim(),
-        releaseDate: String(exitDate).trim(),
-        reason: modality,
-        resultingStatus,
-        ...(modality === 'TRANSFERENCIA'
-          ? {
-              destinationProvinceId,
-              destinationEstablishmentId: String(destinationEstablishmentId).trim()
-            }
-          : {}),
-        ...(notes ? { notes: String(notes).trim() } : {}),
-        registeredBy: user.profile.fullName,
-        registeredAt: nowIso
-      };
-
-      await db.collection('pnap_releases').doc(releaseRecord.releaseId).set(releaseRecord);
-
-      if (modality === 'TRANSFERENCIA' && destinationProvinceId) {
-        const transferRecord: TransferRecord = {
-          transferId: `trf-${Date.now()}`,
-          inmateId,
-          inmateName: inmate.profile.fullName,
-          matricula: inmate.profile.matricula,
-          originProvinceId: inmate.provinceId,
-          originEstablishmentId: inmate.establishmentId,
+        {
+          modality,
+          documentNumber: String(documentNumber).trim(),
+          authorityOrDetail: String(authorityOrDetail).trim(),
+          exitDate: String(exitDate).trim(),
           destinationProvinceId,
-          destinationEstablishmentId: String(destinationEstablishmentId).trim(),
-          requestDate: String(exitDate).trim(),
-          status: user.assignments.role === 'CENTRAL_ADMIN' ? 'AUTORIZADO_CENTRAL' : 'PENDENTE',
-          justification: String(notes || '').trim() || `Guia ${releaseRecord.alvaraNumber}`,
-          securityEscort: releaseRecord.judgeName,
-          authorizedBy: user.profile.fullName
-        };
-        await db.collection('pnap_transfers').doc(transferRecord.transferId).set(transferRecord);
-      }
-
-      await deps.writeAuditLog({
-        userId: user.uid,
-        userName: user.profile.fullName,
-        userRole: user.assignments.role,
-        userScopeProvince:
-          user.assignments.role === 'CENTRAL_ADMIN'
-            ? 'CENTRAL_GLOBAL'
-            : user.assignments.assignedProvinceId,
-        action: 'INMATE_EXIT_REGISTERED',
-        targetResource: `pnap/provinces/${inmate.provinceId}/establishments/${inmate.establishmentId}/inmates/${inmateId}`,
-        details: `Saída registada [${modality} ➔ ${resultingStatus}]: ${inmate.profile.fullName} (${inmate.profile.matricula}) | Doc: ${releaseRecord.alvaraNumber} | Data: ${releaseRecord.releaseDate} | Unidade: ${unitLabel} | Oficial: ${user.profile.fullName}.`,
-        ipAddress: extractClientIp(req),
-        jurisdictionStatus: 'AUTHORIZED'
-      });
+          destinationEstablishmentId,
+          notes,
+          approvedByDirector,
+          extinguishProcessId,
+          expectedVersion: parsedExpectedVersion
+        }
+      );
 
       res.status(200).json({
         success: true,
-        message: `Saída registada (${modality} ➔ ${resultingStatus}): ${inmate.profile.fullName}.`,
-        record: releaseRecord
+        message: `Saída registada (${modality} ➔ ${result.record.resultingStatus}): ${inmate.profile.fullName}.`,
+        record: result.record,
+        inmate: result.inmate,
+        ...(result.transfer ? { transfer: result.transfer } : {}),
+        ...(result.movement ? { movement: result.movement } : {})
       });
     } catch (err) {
       handleServerError(err, res, 'Erro ao registar saída do recluso.');
     }
   });
 
-  // --- TRANSIÇÃO PENAL (DETIDO/PREVENTIVO -> CONDENADO VIA FICHA ÚNICA) ---
+  // --- TRANSIÇÃO PENAL TRANSACIONAL (DETIDO/PREVENTIVO -> CONDENADO) ---
   app.post(
     '/api/pnap/inmates/:inmateId/legal-transition',
     requirePnapAuth,
@@ -1077,6 +1513,7 @@ export function createApp(customDeps?: Partial<ServerDependencies>) {
       const user = req.pnapUser!;
       const inmateId = String(req.params.inmateId || '').trim();
       const {
+        processId,
         courtName,
         sentenceAcordaoNumber,
         sentenceDate,
@@ -1085,13 +1522,13 @@ export function createApp(customDeps?: Partial<ServerDependencies>) {
         totalSentenceMonths,
         regime,
         judgeName,
-        notes
+        notes,
+        expectedVersion
       } = req.body || {};
 
       try {
         const db = deps.getDb();
-        const inmateRef = db.collection('pnap_inmates').doc(inmateId);
-        const inmateSnap = await inmateRef.get();
+        const inmateSnap = await db.collection('pnap_inmates').doc(inmateId).get();
         if (!inmateSnap.exists) {
           res.status(404).json({
             error: 'INMATE_NOT_FOUND',
@@ -1101,8 +1538,7 @@ export function createApp(customDeps?: Partial<ServerDependencies>) {
         }
 
         const targetInmate = inmateSnap.data() as Inmate;
-
-        if (!canOperateEstablishment(user, targetInmate.provinceId, targetInmate.establishmentId)) {
+        if (!canManagePenalControl(user, targetInmate.provinceId, targetInmate.establishmentId)) {
           await logBlockedAttempt(
             req,
             user,
@@ -1112,153 +1548,38 @@ export function createApp(customDeps?: Partial<ServerDependencies>) {
           );
           res.status(403).json({
             error: 'FORBIDDEN',
-            message: `Acesso Negado: Sem competência territorial na província ${targetInmate.provinceId.toUpperCase()}.`
+            message: `Acesso Negado: Sem competência na província ${targetInmate.provinceId.toUpperCase()}.`
           });
           return;
         }
 
-        if (targetInmate.currentStatus !== 'ATIVO') {
-          res.status(409).json({
-            error: 'INMATE_NOT_ACTIVE',
-            message: `Transição rejeitada: Recluso não está ATIVO (${targetInmate.currentStatus}).`
-          });
-          return;
-        }
+        const parsedExpectedVersion =
+          expectedVersion !== undefined ? Number(expectedVersion) : undefined;
 
-        if (
-          targetInmate.legal.legalStatus !== 'PREVENTIVO' &&
-          targetInmate.legal.legalStatus !== 'RECORRENTE'
-        ) {
-          res.status(409).json({
-            error: 'ALREADY_CONVICTED',
-            message: `Transição já efetuada: Ficha Única já consta como ${targetInmate.legal.legalStatus}.`
-          });
-          return;
-        }
-
-        const years = Math.max(0, Math.floor(Number(totalSentenceYears) || 0));
-        const extraMonths = Math.max(0, Math.min(11, Math.floor(Number(totalSentenceMonths) || 0)));
-        const totalMonths = years * 12 + extraMonths;
-
-        if (
-          !String(sentenceAcordaoNumber || '').trim() ||
-          !String(transitDate || '').trim() ||
-          totalMonths <= 0
-        ) {
-          res.status(400).json({
-            error: 'INVALID_TRANSITION_DATA',
-            message: 'Preencha N.º do Mandado/Acórdão, Data de Trânsito e Pena válida.'
-          });
-          return;
-        }
-
-        const transitIso = String(transitDate).trim();
-        const computedEnd = addMonthsIso(
-          targetInmate.admission.admissionDate,
-          totalMonths,
-          transitIso
-        );
-        const computedParole = addMonthsIso(
-          targetInmate.admission.admissionDate,
-          Math.max(1, Math.floor(totalMonths / 2)),
-          transitIso
-        );
-        const previousStatus: 'PREVENTIVO' | 'RECORRENTE' =
-          targetInmate.legal.legalStatus === 'RECORRENTE' ? 'RECORRENTE' : 'PREVENTIVO';
-        const effectiveCourt = String(courtName || '').trim() || targetInmate.admission.courtName;
-
-        const updatedInmate: Inmate = {
-          ...targetInmate,
-          legal: {
-            ...targetInmate.legal,
-            legalStatus: 'CONDENADO',
-            totalSentenceYears: years,
-            totalSentenceMonths: totalMonths,
-            endOfSentenceDate: computedEnd,
-            eligibleParoleDate: computedParole
-          },
-          documents: [
-            {
-              documentId: `doc-sent-${Date.now()}`,
-              title: `Mandado / Sentença: ${String(sentenceAcordaoNumber).trim()}`,
-              type: 'CERTIDAO_SENTENCA',
-              uploadDate: transitIso,
-              fileSize: 'Digital (PNAP)'
-            },
-            ...(targetInmate.documents || [])
-          ]
-        };
-
-        await inmateRef.set(updatedInmate);
-
-        const transitionRecord: LegalTransitionRecord = {
-          transitionId: `trans-${Date.now()}`,
+        const result = await legalTransitionTransactional(
+          db,
+          { user, ipAddress: extractClientIp(req) },
           inmateId,
-          inmateName: targetInmate.profile.fullName,
-          matricula: targetInmate.profile.matricula,
-          provinceId: targetInmate.provinceId,
-          establishmentId: targetInmate.establishmentId,
-          previousStatus,
-          newStatus: 'CONDENADO',
-          courtName: effectiveCourt,
-          sentenceAcordaoNumber: String(sentenceAcordaoNumber).trim(),
-          sentenceDate: String(sentenceDate || '').trim() || transitIso,
-          transitDate: transitIso,
-          totalSentenceYears: years,
-          totalSentenceMonths: extraMonths,
-          regime: regime === 'SEMI_ABERTO' ? 'SEMI_ABERTO' : 'FECHADO',
-          judgeName: String(judgeName || '').trim() || 'Magistrado Judicial',
-          effectiveDate: new Date().toISOString().split('T')[0],
-          registeredBy: user.profile.fullName,
-          ...(notes ? { notes: String(notes).trim() } : {})
-        };
-
-        await db
-          .collection('pnap_legal_transitions')
-          .doc(transitionRecord.transitionId)
-          .set(transitionRecord);
-
-        const indexRef = db.collection('pnap_national_inmate_index').doc(inmateId);
-        const indexSnap = await indexRef.get();
-        if (indexSnap.exists) {
-          const indexData = indexSnap.data() as NationalInmateIndexItem;
-          await indexRef.set({
-            ...indexData,
-            legalStatus: 'CONDENADO',
-            lastUpdated: new Date().toISOString()
-          });
-        }
-
-        const statsRef = db.collection('pnap_province_stats').doc(targetInmate.provinceId);
-        const statsSnap = await statsRef.get();
-        if (statsSnap.exists) {
-          const prevStats = statsSnap.data() as ProvinceStatistics;
-          await statsRef.set({
-            ...prevStats,
-            preventiveCount: Math.max(0, prevStats.preventiveCount - 1),
-            convictedCount: prevStats.convictedCount + 1
-          });
-        }
-
-        await deps.writeAuditLog({
-          userId: user.uid,
-          userName: user.profile.fullName,
-          userRole: user.assignments.role,
-          userScopeProvince:
-            user.assignments.role === 'CENTRAL_ADMIN'
-              ? 'CENTRAL_GLOBAL'
-              : user.assignments.assignedProvinceId,
-          action: 'INMATE_LEGAL_TRANSITION',
-          targetResource: `pnap/provinces/${targetInmate.provinceId}/inmates/${inmateId}`,
-          details: `Ficha Única Atualizada [${previousStatus} ➔ CONDENADO]: ${targetInmate.profile.fullName} (${targetInmate.profile.matricula}) · Pena: ${years}a ${extraMonths}m · Doc: ${transitionRecord.sentenceAcordaoNumber} · Término: ${computedEnd}.`,
-          ipAddress: extractClientIp(req),
-          jurisdictionStatus: 'AUTHORIZED'
-        });
+          {
+            processId,
+            courtName,
+            sentenceAcordaoNumber: String(sentenceAcordaoNumber || ''),
+            sentenceDate,
+            transitDate: String(transitDate || ''),
+            totalSentenceYears: Number(totalSentenceYears) || 0,
+            totalSentenceMonths: Number(totalSentenceMonths) || 0,
+            regime,
+            judgeName,
+            notes,
+            expectedVersion: parsedExpectedVersion
+          }
+        );
 
         res.status(200).json({
           success: true,
-          message: `Ficha Única atualizada: ${targetInmate.profile.fullName} convertido para CONDENADO.`,
-          record: transitionRecord
+          message: `Ficha Única atualizada: ${result.inmate.profile.fullName} convertido para CONDENADO.`,
+          record: result.transition,
+          inmate: result.inmate
         });
       } catch (err) {
         handleServerError(err, res, 'Erro ao registar transição penal.');
@@ -1266,7 +1587,174 @@ export function createApp(customDeps?: Partial<ServerDependencies>) {
     }
   );
 
-  // --- TRANSFERÊNCIA FÍSICA ---
+  // --- PROCESSOS JUDICIAIS MÚLTIPLOS (ORTOGONALIDADE CUSTÓDIA × JURÍDICO) ---
+  app.get(
+    '/api/pnap/inmates/:inmateId/processes',
+    requirePnapAuth,
+    async (req: AuthenticatedRequest, res) => {
+      const user = req.pnapUser!;
+      const inmateId = String(req.params.inmateId || '').trim();
+      if (!inmateId) {
+        res.status(400).json({ error: 'INVALID_INMATE_ID', message: 'ID do recluso inválido.' });
+        return;
+      }
+
+      if (user.assignments.role === 'HEALTH_SPECIALIST') {
+        res.status(403).json({
+          error: 'FORBIDDEN',
+          message: 'Segregação de funções: perfil clínico não acede aos processos judiciais.'
+        });
+        return;
+      }
+
+      try {
+        const db = deps.getDb();
+        const inmateSnap = await db.collection('pnap_inmates').doc(inmateId).get();
+        if (!inmateSnap.exists) {
+          res.status(404).json({ error: 'INMATE_NOT_FOUND', message: 'FUR não encontrada.' });
+          return;
+        }
+        const inmate = inmateSnap.data() as Inmate;
+        const canInspect =
+          user.assignments.role === 'AUDITOR_INSPECTOR'
+            ? canOperateProvince(user, inmate.provinceId)
+            : canOperateEstablishment(user, inmate.provinceId, inmate.establishmentId);
+
+        if (!canInspect) {
+          await logBlockedAttempt(
+            req,
+            user,
+            'BLOCKED_JUDICIAL_PROCESSES_READ',
+            `pnap/inmates/${inmateId}/judicial_processes`,
+            'Tentativa bloqueada de leitura de processos judiciais fora da jurisdição.'
+          );
+          res.status(403).json({ error: 'FORBIDDEN', message: 'Sem jurisdição territorial.' });
+          return;
+        }
+
+        const snap = await db
+          .collection('pnap_inmates')
+          .doc(inmateId)
+          .collection('judicial_processes')
+          .get();
+        const processes = snap.docs.map((d) => d.data() as JudicialProcess);
+        res.status(200).json({ inmateId, processes });
+      } catch (err) {
+        handleServerError(err, res, 'Erro ao consultar processos judiciais da FUR.');
+      }
+    }
+  );
+
+  app.post(
+    '/api/pnap/inmates/:inmateId/processes',
+    requirePnapAuth,
+    async (req: AuthenticatedRequest, res) => {
+      const user = req.pnapUser!;
+      const inmateId = String(req.params.inmateId || '').trim();
+      try {
+        const db = deps.getDb();
+        const inmateSnap = await db.collection('pnap_inmates').doc(inmateId).get();
+        if (!inmateSnap.exists) {
+          res.status(404).json({ error: 'INMATE_NOT_FOUND', message: 'FUR não encontrada.' });
+          return;
+        }
+        const inmate = inmateSnap.data() as Inmate;
+        if (!canManagePenalControl(user, inmate.provinceId, inmate.establishmentId)) {
+          await logBlockedAttempt(
+            req,
+            user,
+            'BLOCKED_JUDICIAL_PROCESS_CREATE',
+            `pnap/inmates/${inmateId}/judicial_processes`,
+            'Tentativa não autorizada de vincular processo judicial.'
+          );
+          res.status(403).json({ error: 'FORBIDDEN', message: 'Sem competência de Controlo Penal.' });
+          return;
+        }
+
+        const expectedVersion =
+          req.body?.expectedVersion !== undefined ? Number(req.body.expectedVersion) : undefined;
+        const result = await addJudicialProcessTransactional(
+          db,
+          { user, ipAddress: extractClientIp(req) },
+          inmateId,
+          { ...(req.body || {}), expectedVersion }
+        );
+        res.status(201).json({ success: true, ...result });
+      } catch (err) {
+        handleServerError(err, res, 'Erro ao vincular processo judicial.');
+      }
+    }
+  );
+
+  app.post(
+    '/api/pnap/inmates/:inmateId/processes/:processId/extinguish',
+    requirePnapAuth,
+    async (req: AuthenticatedRequest, res) => {
+      const user = req.pnapUser!;
+      const inmateId = String(req.params.inmateId || '').trim();
+      const processId = String(req.params.processId || '').trim();
+      try {
+        const db = deps.getDb();
+        const inmateSnap = await db.collection('pnap_inmates').doc(inmateId).get();
+        if (!inmateSnap.exists) {
+          res.status(404).json({ error: 'INMATE_NOT_FOUND', message: 'FUR não encontrada.' });
+          return;
+        }
+        const inmate = inmateSnap.data() as Inmate;
+        if (!canManagePenalControl(user, inmate.provinceId, inmate.establishmentId)) {
+          await logBlockedAttempt(
+            req,
+            user,
+            'BLOCKED_JUDICIAL_PROCESS_EXTINGUISH',
+            `pnap/inmates/${inmateId}/judicial_processes/${processId}`,
+            'Tentativa não autorizada de extinguir processo judicial.'
+          );
+          res.status(403).json({ error: 'FORBIDDEN', message: 'Sem competência de Controlo Penal.' });
+          return;
+        }
+
+        const expectedVersion =
+          req.body?.expectedVersion !== undefined ? Number(req.body.expectedVersion) : undefined;
+        const result = await extinguishJudicialProcessTransactional(
+          db,
+          { user, ipAddress: extractClientIp(req) },
+          inmateId,
+          processId,
+          {
+            extintionReason: String(req.body?.extintionReason || ''),
+            extintionDate: req.body?.extintionDate,
+            expectedVersion
+          }
+        );
+        res.status(200).json({ success: true, ...result });
+      } catch (err) {
+        handleServerError(err, res, 'Erro ao extinguir processo judicial.');
+      }
+    }
+  );
+
+  // --- TRANSFERÊNCIA EM DUAS ETAPAS (ETAPA 1: DESPACHO ORIGEM / ETAPA 2: RECEPÇÃO DESTINO) ---
+  app.get('/api/pnap/transfers', requirePnapAuth, async (req: AuthenticatedRequest, res) => {
+    const user = req.pnapUser!;
+    try {
+      const db = deps.getDb();
+      const snap = await db.collection('pnap_transfers').get();
+      let transfers = snap.docs.map((d) => d.data() as TransferRecord);
+      if (
+        user.assignments.role !== 'CENTRAL_ADMIN' &&
+        !(user.assignments.role === 'AUDITOR_INSPECTOR' && user.assignments.assignedProvinceId === 'all')
+      ) {
+        const prov = user.assignments.assignedProvinceId;
+        transfers = transfers.filter(
+          (t) => t.originProvinceId === prov || t.destinationProvinceId === prov
+        );
+      }
+      res.status(200).json({ transfers });
+    } catch (err) {
+      handleServerError(err, res, 'Erro ao listar guias de transferência.');
+    }
+  });
+
   app.post('/api/pnap/transfers/request', requirePnapAuth, async (req: AuthenticatedRequest, res) => {
     const user = req.pnapUser!;
     const {
@@ -1340,6 +1828,760 @@ export function createApp(customDeps?: Partial<ServerDependencies>) {
     }
   });
 
+  app.post(
+    '/api/pnap/inmates/:inmateId/transfer/dispatch',
+    requirePnapAuth,
+    async (req: AuthenticatedRequest, res) => {
+      const user = req.pnapUser!;
+      const inmateId = String(req.params.inmateId || '').trim();
+      try {
+        const db = deps.getDb();
+        const inmateSnap = await db.collection('pnap_inmates').doc(inmateId).get();
+        if (!inmateSnap.exists) {
+          res.status(404).json({ error: 'INMATE_NOT_FOUND', message: 'FUR não encontrada.' });
+          return;
+        }
+        const inmate = inmateSnap.data() as Inmate;
+        if (!canManagePenalControl(user, inmate.provinceId, inmate.establishmentId)) {
+          await logBlockedAttempt(
+            req,
+            user,
+            'BLOCKED_TRANSFER_DISPATCH',
+            `pnap/inmates/${inmateId}/transfer/dispatch`,
+            'Tentativa bloqueada de despacho de transferência sem competência na unidade de origem.'
+          );
+          res.status(403).json({
+            error: 'FORBIDDEN',
+            message: 'Acesso Negado: Sem competência na unidade de origem para despachar transferência.'
+          });
+          return;
+        }
+
+        const expectedVersion =
+          req.body?.expectedVersion !== undefined ? Number(req.body.expectedVersion) : undefined;
+        const result = await dispatchTransferTransactional(
+          db,
+          { user, ipAddress: extractClientIp(req) },
+          inmateId,
+          {
+            destinationProvinceId: req.body?.destinationProvinceId,
+            destinationEstablishmentId: String(req.body?.destinationEstablishmentId || ''),
+            documentNumber: String(req.body?.documentNumber || ''),
+            securityEscort: String(req.body?.securityEscort || 'Escolta PNAP'),
+            justification: String(req.body?.justification || ''),
+            exitDate: req.body?.exitDate,
+            expectedVersion
+          }
+        );
+
+        res.status(200).json({ success: true, ...result });
+      } catch (err) {
+        handleServerError(err, res, 'Erro ao despachar transferência na origem.');
+      }
+    }
+  );
+
+  app.post(
+    '/api/pnap/transfers/:transferId/receive',
+    requirePnapAuth,
+    async (req: AuthenticatedRequest, res) => {
+      const user = req.pnapUser!;
+      const transferId = String(req.params.transferId || '').trim();
+      try {
+        const db = deps.getDb();
+        const trfSnap = await db.collection('pnap_transfers').doc(transferId).get();
+        if (!trfSnap.exists) {
+          res.status(404).json({ error: 'TRANSFER_NOT_FOUND', message: 'Guia de transferência não encontrada.' });
+          return;
+        }
+        const transfer = trfSnap.data() as TransferRecord;
+
+        if (
+          !canManagePenalControl(
+            user,
+            transfer.destinationProvinceId,
+            transfer.destinationEstablishmentId
+          )
+        ) {
+          await logBlockedAttempt(
+            req,
+            user,
+            'BLOCKED_TRANSFER_RECEIVE',
+            `pnap/transfers/${transferId}/receive`,
+            `Tentativa bloqueada de recepção de transferência fora da unidade de destino (${transfer.destinationProvinceId.toUpperCase()} / ${transfer.destinationEstablishmentId}).`
+          );
+          res.status(403).json({
+            error: 'FORBIDDEN',
+            message: `Acesso Negado: Apenas o destino (${transfer.destinationProvinceId.toUpperCase()}) ou CENTRAL_ADMIN podem concluir a recepção.`
+          });
+          return;
+        }
+
+        const expectedVersion =
+          req.body?.expectedVersion !== undefined ? Number(req.body.expectedVersion) : undefined;
+        const result = await receiveTransferTransactional(
+          db,
+          { user, ipAddress: extractClientIp(req) },
+          transferId,
+          {
+            targetPavilionId: req.body?.targetPavilionId,
+            targetBlockId: req.body?.targetBlockId,
+            targetCellId: req.body?.targetCellId,
+            notes: req.body?.notes,
+            expectedVersion
+          }
+        );
+
+        res.status(200).json({ success: true, ...result });
+      } catch (err) {
+        handleServerError(err, res, 'Erro ao recepcionar recluso transferido no destino.');
+      }
+    }
+  );
+
+  // --- RECAPTURA DE EVADIDO (REATIVAÇÃO DA MESMA FUR E MATRÍCULA) ---
+  app.post(
+    '/api/pnap/inmates/:inmateId/recapture',
+    requirePnapAuth,
+    async (req: AuthenticatedRequest, res) => {
+      const user = req.pnapUser!;
+      const inmateId = String(req.params.inmateId || '').trim();
+      const targetProvinceId = req.body?.provinceId;
+      const targetEstablishmentId = String(req.body?.establishmentId || '').trim();
+
+      if (!isValidProvinceId(targetProvinceId) || !targetEstablishmentId) {
+        res.status(400).json({
+          error: 'INVALID_RECAPTURE_DATA',
+          message: 'Província e estabelecimento de recolha são obrigatórios para recaptura.'
+        });
+        return;
+      }
+
+      if (!canManagePenalControl(user, targetProvinceId, targetEstablishmentId)) {
+        await logBlockedAttempt(
+          req,
+          user,
+          'BLOCKED_INMATE_RECAPTURE',
+          `pnap/inmates/${inmateId}/recapture`,
+          `Tentativa bloqueada de recaptura na unidade ${targetEstablishmentId} fora da jurisdição.`
+        );
+        res.status(403).json({
+          error: 'FORBIDDEN',
+          message: `Acesso Negado: Sem competência de Controlo Penal para recaptura em ${targetProvinceId.toUpperCase()}.`
+        });
+        return;
+      }
+
+      try {
+        const expectedVersion =
+          req.body?.expectedVersion !== undefined ? Number(req.body.expectedVersion) : undefined;
+        const result = await recaptureInmateTransactional(
+          deps.getDb(),
+          { user, ipAddress: extractClientIp(req) },
+          inmateId,
+          {
+            provinceId: targetProvinceId,
+            establishmentId: targetEstablishmentId,
+            pavilionId: req.body?.pavilionId,
+            blockId: req.body?.blockId,
+            cellId: req.body?.cellId,
+            documentNumber: String(req.body?.documentNumber || ''),
+            authorityOrEscort: String(req.body?.authorityOrEscort || 'Escolta PNAP'),
+            notes: req.body?.notes,
+            expectedVersion
+          }
+        );
+        res.status(200).json({ success: true, ...result });
+      } catch (err) {
+        handleServerError(err, res, 'Erro ao registar recaptura.');
+      }
+    }
+  );
+
+  // --- MOVIMENTAÇÕES TEMPORÁRIAS COM RESERVA DE CELA (DILIGÊNCIA / HOSPITAL) ---
+  app.get(
+    '/api/pnap/inmates/:inmateId/movements',
+    requirePnapAuth,
+    async (req: AuthenticatedRequest, res) => {
+      const user = req.pnapUser!;
+      const inmateId = String(req.params.inmateId || '').trim();
+      try {
+        const db = deps.getDb();
+        const inmateSnap = await db.collection('pnap_inmates').doc(inmateId).get();
+        if (!inmateSnap.exists) {
+          res.status(404).json({ error: 'INMATE_NOT_FOUND', message: 'FUR não encontrada.' });
+          return;
+        }
+        const inmate = inmateSnap.data() as Inmate;
+        const canRead =
+          user.assignments.role === 'AUDITOR_INSPECTOR'
+            ? canOperateProvince(user, inmate.provinceId)
+            : canOperateEstablishment(user, inmate.provinceId, inmate.establishmentId);
+
+        if (!canRead) {
+          res.status(403).json({ error: 'FORBIDDEN', message: 'Sem jurisdição territorial.' });
+          return;
+        }
+
+        const snap = await db
+          .collection('pnap_movements')
+          .where('inmateId', '==', inmateId)
+          .get();
+        const movements = snap.docs
+          .map((d) => d.data() as MovementRecord)
+          .sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+        res.status(200).json({ inmateId, movements });
+      } catch (err) {
+        handleServerError(err, res, 'Erro ao consultar histórico de movimentações.');
+      }
+    }
+  );
+
+  app.post(
+    '/api/pnap/inmates/:inmateId/movements',
+    requirePnapAuth,
+    async (req: AuthenticatedRequest, res) => {
+      const user = req.pnapUser!;
+      const inmateId = String(req.params.inmateId || '').trim();
+      try {
+        const db = deps.getDb();
+        const inmateSnap = await db.collection('pnap_inmates').doc(inmateId).get();
+        if (!inmateSnap.exists) {
+          res.status(404).json({ error: 'INMATE_NOT_FOUND', message: 'FUR não encontrada.' });
+          return;
+        }
+        const inmate = inmateSnap.data() as Inmate;
+        if (!canRegisterPhysicalMovement(user, inmate.provinceId, inmate.establishmentId)) {
+          await logBlockedAttempt(
+            req,
+            user,
+            'BLOCKED_MOVEMENT_REGISTRATION',
+            `pnap/inmates/${inmateId}/movements`,
+            'Tentativa não autorizada de registo de movimentação física.'
+          );
+          res.status(403).json({
+            error: 'FORBIDDEN',
+            message: 'Acesso Negado: Sem competência de Portaria/Escolta ou Controlo Penal.'
+          });
+          return;
+        }
+
+        const expectedVersion =
+          req.body?.expectedVersion !== undefined ? Number(req.body.expectedVersion) : undefined;
+        const result = await registerTemporaryMovementTransactional(
+          db,
+          { user, ipAddress: extractClientIp(req) },
+          inmateId,
+          {
+            type: req.body?.type,
+            documentNumber: String(req.body?.documentNumber || ''),
+            authorityOrEscort: String(req.body?.authorityOrEscort || ''),
+            destinationLabel: req.body?.destinationLabel,
+            notes: req.body?.notes,
+            expectedVersion
+          }
+        );
+
+        res.status(200).json({ success: true, ...result });
+      } catch (err) {
+        handleServerError(err, res, 'Erro ao registar movimentação temporária.');
+      }
+    }
+  );
+
+  // --- MÓDULO SAÚDE & SIGILO CLÍNICO (EXCLUSIVO HEALTH_SPECIALIST) ---
+  app.get(
+    '/api/pnap/inmates/:inmateId/health-records',
+    requirePnapAuth,
+    async (req: AuthenticatedRequest, res) => {
+      const user = req.pnapUser!;
+      const inmateId = String(req.params.inmateId || '').trim();
+      try {
+        const db = deps.getDb();
+        const inmateSnap = await db.collection('pnap_inmates').doc(inmateId).get();
+        if (!inmateSnap.exists) {
+          res.status(404).json({ error: 'INMATE_NOT_FOUND', message: 'FUR não encontrada.' });
+          return;
+        }
+        const inmate = inmateSnap.data() as Inmate;
+        if (!canAccessClinicalRecords(user, inmate.provinceId, inmate.establishmentId)) {
+          await logBlockedAttempt(
+            req,
+            user,
+            'BLOCKED_CLINICAL_RECORDS_READ',
+            `pnap/inmates/${inmateId}/health_records`,
+            `Sigilo clínico protegido: perfil ${user.assignments.role} impedido de ler prontuário médico.`
+          );
+          res.status(403).json({
+            error: 'CLINICAL_SECRECY_VIOLATION',
+            message: 'Sigilo Clínico: Apenas o perfil HEALTH_SPECIALIST da unidade pode consultar prontuários médicos.'
+          });
+          return;
+        }
+
+        const result = await listHealthRecords(
+          db,
+          { user, ipAddress: extractClientIp(req) },
+          inmateId
+        );
+        res.status(200).json({ inmateId, ...result });
+      } catch (err) {
+        handleServerError(err, res, 'Erro ao consultar prontuário clínico.');
+      }
+    }
+  );
+
+  app.post(
+    '/api/pnap/inmates/:inmateId/health-records',
+    requirePnapAuth,
+    async (req: AuthenticatedRequest, res) => {
+      const user = req.pnapUser!;
+      const inmateId = String(req.params.inmateId || '').trim();
+      try {
+        const db = deps.getDb();
+        const inmateSnap = await db.collection('pnap_inmates').doc(inmateId).get();
+        if (!inmateSnap.exists) {
+          res.status(404).json({ error: 'INMATE_NOT_FOUND', message: 'FUR não encontrada.' });
+          return;
+        }
+        const inmate = inmateSnap.data() as Inmate;
+        if (!canAccessClinicalRecords(user, inmate.provinceId, inmate.establishmentId)) {
+          await logBlockedAttempt(
+            req,
+            user,
+            'BLOCKED_CLINICAL_RECORDS_WRITE',
+            `pnap/inmates/${inmateId}/health_records`,
+            `Tentativa bloqueada de escrita clínica por perfil ${user.assignments.role}.`
+          );
+          res.status(403).json({
+            error: 'CLINICAL_SECRECY_VIOLATION',
+            message: 'Sigilo Clínico: Apenas HEALTH_SPECIALIST pode registar avaliações médicas.'
+          });
+          return;
+        }
+
+        const expectedVersion =
+          req.body?.expectedVersion !== undefined ? Number(req.body.expectedVersion) : undefined;
+        const result = await recordClinicalEvaluationTransactional(
+          db,
+          { user, ipAddress: extractClientIp(req) },
+          inmateId,
+          { ...(req.body || {}), expectedVersion }
+        );
+        res.status(201).json({ success: true, ...result });
+      } catch (err) {
+        handleServerError(err, res, 'Erro ao registar avaliação clínica.');
+      }
+    }
+  );
+
+  // --- MÓDULO REABILITAÇÃO, CLASSIFICAÇÃO & ALOJAMENTO COMPATÍVEL ---
+  app.post(
+    '/api/pnap/inmates/:inmateId/rehabilitation',
+    requirePnapAuth,
+    async (req: AuthenticatedRequest, res) => {
+      const user = req.pnapUser!;
+      const inmateId = String(req.params.inmateId || '').trim();
+      try {
+        const db = deps.getDb();
+        const inmateSnap = await db.collection('pnap_inmates').doc(inmateId).get();
+        if (!inmateSnap.exists) {
+          res.status(404).json({ error: 'INMATE_NOT_FOUND', message: 'FUR não encontrada.' });
+          return;
+        }
+        const inmate = inmateSnap.data() as Inmate;
+        if (!canManageRehabilitation(user, inmate.provinceId, inmate.establishmentId)) {
+          await logBlockedAttempt(
+            req,
+            user,
+            'BLOCKED_REHABILITATION_UPDATE',
+            `pnap/inmates/${inmateId}/rehabilitation`,
+            `Tentativa não autorizada de alteração de classificação/alojamento por ${user.assignments.role}.`
+          );
+          res.status(403).json({
+            error: 'FORBIDDEN',
+            message: 'Acesso Negado: Sem competência de Reabilitação ou Direção nesta unidade.'
+          });
+          return;
+        }
+
+        const expectedVersion =
+          req.body?.expectedVersion !== undefined ? Number(req.body.expectedVersion) : undefined;
+        const result = await updateRehabilitationTransactional(
+          db,
+          { user, ipAddress: extractClientIp(req) },
+          inmateId,
+          { ...(req.body || {}), expectedVersion }
+        );
+        res.status(200).json({
+          success: true,
+          inmate: redactInmateClinicalData(result.inmate, user.assignments.role)
+        });
+      } catch (err) {
+        handleServerError(err, res, 'Erro ao atualizar reabilitação e classificação.');
+      }
+    }
+  );
+
+  // --- MÓDULO INCIDENTES & SANÇÕES DISCIPLINARES (INCLUINDO INCIDENTES COM VISITANTES NA FUR) ---
+  app.post(
+    '/api/pnap/inmates/:inmateId/incidents',
+    requirePnapAuth,
+    async (req: AuthenticatedRequest, res) => {
+      const user = req.pnapUser!;
+      const inmateId = String(req.params.inmateId || '').trim();
+      const source: 'INTERNO' | 'VISITA' = req.body?.source === 'VISITA' ? 'VISITA' : 'INTERNO';
+      try {
+        const db = deps.getDb();
+        const inmateSnap = await db.collection('pnap_inmates').doc(inmateId).get();
+        if (!inmateSnap.exists) {
+          res.status(404).json({ error: 'INMATE_NOT_FOUND', message: 'FUR não encontrada.' });
+          return;
+        }
+        const inmate = inmateSnap.data() as Inmate;
+        const authorized =
+          source === 'VISITA'
+            ? canRegisterPhysicalMovement(user, inmate.provinceId, inmate.establishmentId)
+            : canManagePenalControl(user, inmate.provinceId, inmate.establishmentId);
+
+        if (!authorized) {
+          await logBlockedAttempt(
+            req,
+            user,
+            'BLOCKED_INCIDENT_REGISTRATION',
+            `pnap/inmates/${inmateId}/incidents`,
+            `Tentativa não autorizada de registo de incidente (${source}).`
+          );
+          res.status(403).json({
+            error: 'FORBIDDEN',
+            message:
+              source === 'VISITA'
+                ? 'Acesso Negado: Sem competência de Portaria/Controlo Penal para registar incidente de visita.'
+                : 'Acesso Negado: Sem competência disciplinar/controlo penal nesta unidade.'
+          });
+          return;
+        }
+
+        const expectedVersion =
+          req.body?.expectedVersion !== undefined ? Number(req.body.expectedVersion) : undefined;
+        const result = await registerIncidentAndSanctionTransactional(
+          db,
+          { user, ipAddress: extractClientIp(req) },
+          inmateId,
+          { ...(req.body || {}), source, expectedVersion }
+        );
+        res.status(201).json({
+          success: true,
+          incident: result.incident,
+          inmate: redactInmateClinicalData(result.inmate, user.assignments.role)
+        });
+      } catch (err) {
+        handleServerError(err, res, 'Erro ao registar ocorrência disciplinar.');
+      }
+    }
+  );
+
+  // --- MÓDULO VISITAS & PORTARIA (INTEGRADO NA FICHA ÚNICA DO RECLUSO) ---
+  function resolveReadScope(user: PnapUser, inmateId: string) {
+    const isGlobal =
+      user.assignments.role === 'CENTRAL_ADMIN' ||
+      (user.assignments.role === 'AUDITOR_INSPECTOR' &&
+        user.assignments.assignedProvinceId === 'all');
+    const establishmentScoped =
+      user.assignments.role !== 'CENTRAL_ADMIN' &&
+      user.assignments.role !== 'PROVINCIAL_COMMAND' &&
+      user.assignments.role !== 'AUDITOR_INSPECTOR' &&
+      user.assignments.assignedEstablishmentId
+        ? user.assignments.assignedEstablishmentId
+        : undefined;
+    return {
+      inmateId: inmateId || undefined,
+      provinceId: isGlobal ? undefined : user.assignments.assignedProvinceId,
+      establishmentId: establishmentScoped
+    };
+  }
+
+  app.get('/api/pnap/visitors', requirePnapAuth, async (req: AuthenticatedRequest, res) => {
+    const user = req.pnapUser!;
+    const inmateId = typeof req.query.inmateId === 'string' ? req.query.inmateId.trim() : '';
+    try {
+      const db = deps.getDb();
+      const visitors = await listVisitorsFromFurs(db, resolveReadScope(user, inmateId));
+      res.status(200).json({ visitors });
+    } catch (err) {
+      handleServerError(err, res, 'Erro ao listar visitantes.');
+    }
+  });
+
+  async function handleRegisterVisitorOnFur(req: AuthenticatedRequest, res: Response) {
+    const user = req.pnapUser!;
+    const inmateId = String(req.params.inmateId || req.body?.inmateId || '').trim();
+    if (!inmateId) {
+      res.status(400).json({ error: 'MISSING_INMATE_ID', message: 'ID da FUR é obrigatório.' });
+      return;
+    }
+    try {
+      const db = deps.getDb();
+      const inmateSnap = await db.collection('pnap_inmates').doc(inmateId).get();
+      if (!inmateSnap.exists) {
+        res.status(404).json({ error: 'INMATE_NOT_FOUND', message: 'FUR do recluso não encontrada.' });
+        return;
+      }
+      const inmate = inmateSnap.data() as Inmate;
+      if (!canRegisterPhysicalMovement(user, inmate.provinceId, inmate.establishmentId)) {
+        await logBlockedAttempt(
+          req,
+          user,
+          'BLOCKED_VISITOR_REGISTER',
+          `pnap/inmates/${inmateId}/visitors`,
+          'Tentativa não autorizada de cadastro de visitante na FUR.'
+        );
+        res.status(403).json({ error: 'FORBIDDEN', message: 'Sem competência de Portaria/Controlo.' });
+        return;
+      }
+
+      const expectedVersion =
+        req.body?.expectedVersion !== undefined ? Number(req.body.expectedVersion) : undefined;
+      const result = await registerVisitorTransactional(
+        db,
+        { user, ipAddress: extractClientIp(req) },
+        {
+          inmateId,
+          fullName: String(req.body?.fullName || ''),
+          biNumber: String(req.body?.biNumber || ''),
+          phone: String(req.body?.phone || ''),
+          relationship: String(req.body?.relationship || 'Familiar'),
+          expectedVersion
+        }
+      );
+      res.status(201).json({
+        success: true,
+        visitor: result.visitor,
+        embeddedVisitor: result.embeddedVisitor,
+        deduplicated: result.deduplicated,
+        inmate: redactInmateClinicalData(result.inmate, user.assignments.role)
+      });
+    } catch (err) {
+      handleServerError(err, res, 'Erro ao cadastrar visitante na FUR.');
+    }
+  }
+
+  app.post('/api/pnap/inmates/:inmateId/visitors', requirePnapAuth, handleRegisterVisitorOnFur);
+  app.post('/api/pnap/visitors', requirePnapAuth, handleRegisterVisitorOnFur);
+
+  async function handleUpdateVisitorStatusOnFur(req: AuthenticatedRequest, res: Response) {
+    const user = req.pnapUser!;
+    const visitorId = String(req.params.visitorId || '').trim();
+    const inmateIdHint = String(req.params.inmateId || req.body?.inmateId || '').trim();
+    try {
+      const db = deps.getDb();
+      let scopeInmate: Inmate | null = null;
+      if (inmateIdHint) {
+        const snap = await db.collection('pnap_inmates').doc(inmateIdHint).get();
+        if (snap.exists) scopeInmate = snap.data() as Inmate;
+      } else {
+        const allSnap = await db.collection('pnap_inmates').get();
+        for (const doc of allSnap.docs) {
+          const data = doc.data() as Inmate;
+          if ((data.visitors || []).some((v) => v.visitorId === visitorId)) {
+            scopeInmate = data;
+            break;
+          }
+        }
+        if (!scopeInmate) {
+          const legSnap = await db.collection('pnap_visitors').doc(visitorId).get();
+          if (legSnap.exists) {
+            const leg = legSnap.data() as VisitorRecord;
+            const inmSnap = await db.collection('pnap_inmates').doc(leg.inmateId).get();
+            if (inmSnap.exists) scopeInmate = inmSnap.data() as Inmate;
+          }
+        }
+      }
+
+      if (!scopeInmate) {
+        res.status(404).json({ error: 'VISITOR_NOT_FOUND', message: 'Visitante não encontrado em nenhuma FUR.' });
+        return;
+      }
+
+      if (
+        !canManagePenalControl(user, scopeInmate.provinceId, scopeInmate.establishmentId)
+      ) {
+        await logBlockedAttempt(
+          req,
+          user,
+          'BLOCKED_VISITOR_STATUS_CHANGE',
+          `pnap/inmates/${scopeInmate.inmateId}/visitors/${visitorId}`,
+          'Tentativa não autorizada de suspender/autorizar visitante.'
+        );
+        res.status(403).json({ error: 'FORBIDDEN', message: 'Sem competência de Controlo Penal.' });
+        return;
+      }
+
+      const result = await updateVisitorStatusTransactional(
+        db,
+        { user, ipAddress: extractClientIp(req) },
+        visitorId,
+        req.body?.status,
+        req.body?.reason,
+        scopeInmate.inmateId
+      );
+      res.status(200).json({
+        success: true,
+        visitor: result.visitor,
+        inmate: redactInmateClinicalData(result.inmate, user.assignments.role)
+      });
+    } catch (err) {
+      handleServerError(err, res, 'Erro ao atualizar estado do visitante.');
+    }
+  }
+
+  app.patch(
+    '/api/pnap/inmates/:inmateId/visitors/:visitorId/status',
+    requirePnapAuth,
+    handleUpdateVisitorStatusOnFur
+  );
+  app.patch(
+    '/api/pnap/visitors/:visitorId/status',
+    requirePnapAuth,
+    handleUpdateVisitorStatusOnFur
+  );
+
+  app.get('/api/pnap/visits', requirePnapAuth, async (req: AuthenticatedRequest, res) => {
+    const user = req.pnapUser!;
+    const inmateId = typeof req.query.inmateId === 'string' ? req.query.inmateId.trim() : '';
+    try {
+      const db = deps.getDb();
+      const visits = await listVisitsFromFurs(db, resolveReadScope(user, inmateId));
+      res.status(200).json({ visits });
+    } catch (err) {
+      handleServerError(err, res, 'Erro ao listar histórico de visitas.');
+    }
+  });
+
+  async function handleRegisterVisitOnFur(req: AuthenticatedRequest, res: Response) {
+    const user = req.pnapUser!;
+    const visitorId = String(req.body?.visitorId || '').trim();
+    const inmateIdParam = String(req.params.inmateId || req.body?.inmateId || '').trim();
+    try {
+      const db = deps.getDb();
+      let scopeInmate: Inmate | null = null;
+      if (inmateIdParam) {
+        const snap = await db.collection('pnap_inmates').doc(inmateIdParam).get();
+        if (snap.exists) scopeInmate = snap.data() as Inmate;
+      } else if (visitorId) {
+        const allSnap = await db.collection('pnap_inmates').get();
+        for (const doc of allSnap.docs) {
+          const data = doc.data() as Inmate;
+          if ((data.visitors || []).some((v) => v.visitorId === visitorId)) {
+            scopeInmate = data;
+            break;
+          }
+        }
+        if (!scopeInmate) {
+          const legSnap = await db.collection('pnap_visitors').doc(visitorId).get();
+          if (legSnap.exists) {
+            const leg = legSnap.data() as VisitorRecord;
+            const inmSnap = await db.collection('pnap_inmates').doc(leg.inmateId).get();
+            if (inmSnap.exists) scopeInmate = inmSnap.data() as Inmate;
+          }
+        }
+      }
+
+      if (!scopeInmate) {
+        res.status(404).json({ error: 'VISITOR_NOT_FOUND', message: 'Visitante ou FUR não encontrado.' });
+        return;
+      }
+
+      if (!canRegisterPhysicalMovement(user, scopeInmate.provinceId, scopeInmate.establishmentId)) {
+        await logBlockedAttempt(
+          req,
+          user,
+          'BLOCKED_VISIT_CHECKIN',
+          `pnap/inmates/${scopeInmate.inmateId}/visits`,
+          'Tentativa não autorizada de registo de visita na portaria.'
+        );
+        res.status(403).json({ error: 'FORBIDDEN', message: 'Sem competência de Portaria/Controlo.' });
+        return;
+      }
+
+      const expectedVersion =
+        req.body?.expectedVersion !== undefined ? Number(req.body.expectedVersion) : undefined;
+      const result = await registerVisitCheckInTransactional(
+        db,
+        { user, ipAddress: extractClientIp(req) },
+        {
+          inmateId: scopeInmate.inmateId,
+          visitorId,
+          date: req.body?.date,
+          timeSlot: req.body?.timeSlot,
+          inspectionPassed: Boolean(req.body?.inspectionPassed),
+          notes: req.body?.notes,
+          expectedVersion
+        }
+      );
+      res.status(201).json({
+        success: true,
+        visit: result.visit,
+        embeddedVisit: result.embeddedVisit,
+        inmate: redactInmateClinicalData(result.inmate, user.assignments.role)
+      });
+    } catch (err) {
+      handleServerError(err, res, 'Erro ao registar entrada de visita.');
+    }
+  }
+
+  app.post('/api/pnap/inmates/:inmateId/visits', requirePnapAuth, handleRegisterVisitOnFur);
+  app.post('/api/pnap/visits', requirePnapAuth, handleRegisterVisitOnFur);
+
+  // --- CATÁLOGOS DINÂMICOS CONFIGURÁVEIS ---
+  app.get('/api/pnap/catalogs', requirePnapAuth, async (_req: AuthenticatedRequest, res) => {
+    try {
+      const db = deps.getDb();
+      const snap = await db.collection('pnap_catalogs').get();
+      const catalogs = snap.docs.map((d) => d.data() as PnapCatalog);
+      res.status(200).json({ catalogs });
+    } catch (err) {
+      handleServerError(err, res, 'Erro ao consultar catálogos configuráveis.');
+    }
+  });
+
+  app.put(
+    '/api/pnap/catalogs/:catalogId',
+    requirePnapAuth,
+    async (req: AuthenticatedRequest, res) => {
+      const user = req.pnapUser!;
+      const catalogId = String(req.params.catalogId || '').trim();
+      if (!canProvision(user)) {
+        await logBlockedAttempt(
+          req,
+          user,
+          'BLOCKED_CATALOG_UPDATE',
+          `pnap/catalogs/${catalogId}`,
+          'Tentativa não autorizada de edição de catálogo nacional.'
+        );
+        res.status(403).json({
+          error: 'FORBIDDEN',
+          message: 'Acesso Negado: Apenas CENTRAL_ADMIN gere os catálogos configuráveis.'
+        });
+        return;
+      }
+      try {
+        const catalog = await upsertCatalogTransactional(
+          deps.getDb(),
+          { user, ipAddress: extractClientIp(req) },
+          catalogId,
+          {
+            category: req.body?.category,
+            items: req.body?.items
+          }
+        );
+        res.status(200).json({ success: true, catalog });
+      } catch (err) {
+        handleServerError(err, res, 'Erro ao atualizar catálogo.');
+      }
+    }
+  );
+
   // --- AUDITORIA IMUTÁVEL ---
   app.get('/api/pnap/audit-logs', requirePnapAuth, async (req: AuthenticatedRequest, res) => {
     const user = req.pnapUser!;
@@ -1360,8 +2602,12 @@ export function createApp(customDeps?: Partial<ServerDependencies>) {
 
     try {
       const db = deps.getDb();
+      const isGlobalAuditAccess =
+        user.assignments.role === 'CENTRAL_ADMIN' ||
+        (user.assignments.role === 'AUDITOR_INSPECTOR' &&
+          user.assignments.assignedProvinceId === 'all');
       let snap;
-      if (user.assignments.role === 'CENTRAL_ADMIN') {
+      if (isGlobalAuditAccess) {
         snap = await db.collection('pnap_audit_logs').get();
       } else {
         snap = await db

@@ -1,12 +1,18 @@
-import React, { useState, useEffect, useMemo } from 'react';
-import { ProvinceId, PnapUser, Inmate } from '../types/pnap';
-import { INMATES_LOCAL_DB } from '../data/mockPnapData';
+import React, { useState, useEffect } from 'react';
+import { ProvinceId, PnapUser, Inmate, NationalInmateIndexItem } from '../types/pnap';
 import { pnapStore } from '../services/pnapStore';
-import { Scale, X, CheckCircle2, Clock, Search, AlertCircle, UserCheck } from 'lucide-react';
+import {
+  ApiClientError,
+  fetchInmateByIdViaApi,
+  registerLegalTransitionViaApi
+} from '../services/apiClient';
+import { InmateSmartFinder } from './shared/InmateSmartFinder';
+import { Scale, X, CheckCircle2, Clock, AlertCircle, UserCheck, RefreshCw } from 'lucide-react';
 
 interface TransicaoModalProps {
   currentProvinceId: ProvinceId;
   currentUser: PnapUser;
+  apiActive?: boolean;
   onClose: () => void;
 }
 
@@ -21,11 +27,14 @@ const addMonthsToIso = (baseDateStr: string, monthsToAdd: number): string => {
 export const TransicaoModal: React.FC<TransicaoModalProps> = ({
   currentProvinceId,
   currentUser,
+  apiActive = false,
   onClose
 }) => {
   const [, setStoreTick] = useState(0);
-  const [searchTerm, setSearchTerm] = useState('');
-  const [selectedInmateId, setSelectedInmateId] = useState<string>('');
+  const [selectedInmate, setSelectedInmate] = useState<Inmate | null>(null);
+  const [hydrating, setHydrating] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [conflictRefreshNeeded, setConflictRefreshNeeded] = useState(false);
   const [feedback, setFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
 
   useEffect(() => {
@@ -43,40 +52,53 @@ export const TransicaoModal: React.FC<TransicaoModalProps> = ({
   const [judgeName, setJudgeName] = useState('');
 
   const transitionsList = pnapStore.getLegalTransitions();
+  const allInmates = pnapStore.getInmates();
 
-  // Reclusos ATIVOS em estado PREVENTIVO/RECORRENTE dentro da jurisdição autorizada
-  const eligiblePreventives = useMemo(() => {
-    const q = searchTerm.trim().toLowerCase();
-    return INMATES_LOCAL_DB.filter((inm) => {
-      const isEligibleStatus =
-        inm.currentStatus === 'ATIVO' &&
-        (inm.legal.legalStatus === 'PREVENTIVO' || inm.legal.legalStatus === 'RECORRENTE');
-      if (!isEligibleStatus || !pnapStore.canOperateProvince(currentUser, inm.provinceId)) {
-        return false;
-      }
-      if (!q) return true;
-      return (
-        inm.profile.fullName.toLowerCase().includes(q) ||
-        inm.profile.matricula.toLowerCase().includes(q) ||
-        inm.profile.biNumber.toLowerCase().includes(q) ||
-        inm.admission.processNumber.toLowerCase().includes(q)
-      );
-    }).sort((a, b) => {
-      if (a.provinceId === currentProvinceId && b.provinceId !== currentProvinceId) return -1;
-      if (a.provinceId !== currentProvinceId && b.provinceId === currentProvinceId) return 1;
-      return a.profile.fullName.localeCompare(b.profile.fullName);
-    });
-  }, [currentUser, currentProvinceId, searchTerm, transitionsList.length]);
-
-  const selectedInmate: Inmate | undefined = INMATES_LOCAL_DB.find(
-    (inm) => inm.inmateId === selectedInmateId
-  );
-
-  const handleSelectInmate = (inmate: Inmate) => {
-    setSelectedInmateId(inmate.inmateId);
-    // Puxa o tribunal diretamente da Ficha Única (sem hardcode), editável caso haja recurso
-    setCourtName(inmate.admission.courtName);
+  const handleSelectIndexItem = async (item: NationalInmateIndexItem) => {
+    setConflictRefreshNeeded(false);
     setFeedback(null);
+
+    if (!apiActive) {
+      const found = allInmates.find((i) => i.inmateId === item.inmateId);
+      if (!found) {
+        setFeedback({ type: 'err', text: 'Ficha Única completa não encontrada na cache local.' });
+        return;
+      }
+      setSelectedInmate(found);
+      setCourtName(found.admission.courtName);
+      return;
+    }
+
+    setHydrating(true);
+    try {
+      const res = await fetchInmateByIdViaApi(item.inmateId);
+      pnapStore.upsertLiveInmate(res.inmate);
+      setSelectedInmate(res.inmate);
+      setCourtName(res.inmate.admission.courtName);
+    } catch (err) {
+      setFeedback({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'Erro ao carregar Ficha Única.'
+      });
+    } finally {
+      setHydrating(false);
+    }
+  };
+
+  const handleReloadInmate = async () => {
+    if (!apiActive || !selectedInmate) return;
+    setBusy(true);
+    try {
+      const res = await fetchInmateByIdViaApi(selectedInmate.inmateId);
+      pnapStore.upsertLiveInmate(res.inmate);
+      setSelectedInmate(res.inmate);
+      setConflictRefreshNeeded(false);
+      setFeedback({ type: 'ok', text: 'Versão mais recente da Ficha Única carregada.' });
+    } catch (err) {
+      setFeedback({ type: 'err', text: err instanceof Error ? err.message : 'Erro ao recarregar.' });
+    } finally {
+      setBusy(false);
+    }
   };
 
   const totalSentenceMonths =
@@ -96,31 +118,61 @@ export const TransicaoModal: React.FC<TransicaoModalProps> = ({
     ? Math.max(0, totalSentenceMonths - selectedInmate.legal.timeServedMonths)
     : 0;
 
-  const handleSubmitTransition = (e: React.FormEvent) => {
+  const handleSubmitTransition = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedInmate) {
       setFeedback({ type: 'err', text: 'Selecione a Ficha Única do recluso.' });
       return;
     }
 
-    const result = pnapStore.registerLegalTransition(currentUser, {
-      inmateId: selectedInmate.inmateId,
-      courtName,
-      sentenceAcordaoNumber: sentenceAcordao,
-      sentenceDate,
-      transitDate,
-      totalSentenceYears: parseInt(years || '0', 10) || 0,
-      totalSentenceMonths: parseInt(months || '0', 10) || 0,
-      regime,
-      judgeName,
-      endOfSentenceDate: computedEndDate !== '—' ? computedEndDate : undefined,
-      eligibleParoleDate: computedParoleDate !== '—' ? computedParoleDate : undefined
-    });
+    if (!apiActive) {
+      const result = pnapStore.registerLegalTransition(currentUser, {
+        inmateId: selectedInmate.inmateId,
+        courtName,
+        sentenceAcordaoNumber: sentenceAcordao,
+        sentenceDate,
+        transitDate,
+        totalSentenceYears: parseInt(years || '0', 10) || 0,
+        totalSentenceMonths: parseInt(months || '0', 10) || 0,
+        regime,
+        judgeName,
+        endOfSentenceDate: computedEndDate !== '—' ? computedEndDate : undefined,
+        eligibleParoleDate: computedParoleDate !== '—' ? computedParoleDate : undefined
+      });
 
-    if (result.success) {
-      setFeedback({ type: 'ok', text: result.message });
-      setSelectedInmateId('');
-      setSearchTerm('');
+      if (result.success) {
+        setFeedback({ type: 'ok', text: result.message });
+        setSelectedInmate(null);
+        setSentenceAcordao('');
+        setCourtName('');
+        setSentenceDate('');
+        setTransitDate('');
+        setYears('');
+        setMonths('');
+        setJudgeName('');
+      } else {
+        setFeedback({ type: 'err', text: result.message });
+      }
+      return;
+    }
+
+    setBusy(true);
+    setConflictRefreshNeeded(false);
+    try {
+      const res = await registerLegalTransitionViaApi(selectedInmate.inmateId, {
+        courtName,
+        sentenceAcordaoNumber: sentenceAcordao,
+        sentenceDate,
+        transitDate,
+        totalSentenceYears: parseInt(years || '0', 10) || 0,
+        totalSentenceMonths: parseInt(months || '0', 10) || 0,
+        regime,
+        judgeName,
+        expectedVersion: selectedInmate.version
+      });
+      if (res.inmate) pnapStore.upsertLiveInmate(res.inmate);
+      setFeedback({ type: 'ok', text: res.message });
+      setSelectedInmate(null);
       setSentenceAcordao('');
       setCourtName('');
       setSentenceDate('');
@@ -128,8 +180,16 @@ export const TransicaoModal: React.FC<TransicaoModalProps> = ({
       setYears('');
       setMonths('');
       setJudgeName('');
-    } else {
-      setFeedback({ type: 'err', text: result.message });
+    } catch (err) {
+      if (err instanceof ApiClientError && err.code === 'VERSION_CONFLICT') {
+        setConflictRefreshNeeded(true);
+      }
+      setFeedback({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'Erro ao registar transição penal.'
+      });
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -173,73 +233,58 @@ export const TransicaoModal: React.FC<TransicaoModalProps> = ({
                 : 'bg-rose-950/80 border-rose-600/50 text-rose-200'
             }`}
           >
-            <span className="flex items-center gap-1.5 truncate">
+            <span className="flex items-center gap-1.5 min-w-0">
               {feedback.type === 'ok' ? (
                 <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
               ) : (
                 <AlertCircle className="w-3.5 h-3.5 shrink-0" />
               )}
-              <span className="truncate">{feedback.text}</span>
+              <span className="break-words">{feedback.text}</span>
             </span>
-            <button
-              type="button"
-              onClick={() => setFeedback(null)}
-              className="text-slate-300 hover:text-white font-bold cursor-pointer"
-            >
-              ✕
-            </button>
+            <div className="flex items-center gap-2 shrink-0">
+              {conflictRefreshNeeded && apiActive && (
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={handleReloadInmate}
+                  className="bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold px-2.5 py-1 rounded-lg flex items-center gap-1 cursor-pointer"
+                >
+                  <RefreshCw className="w-3 h-3" />
+                  <span>Recarregar</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setFeedback(null)}
+                className="text-slate-300 hover:text-white font-bold cursor-pointer"
+              >
+                ✕
+              </button>
+            </div>
           </div>
         )}
 
         {/* CORPO */}
         <div className="p-3 sm:p-5 overflow-y-auto flex-1 space-y-4 text-xs">
-          {/* 1. PROCURA DA FICHA ÚNICA DO RECLUSO PREVENTIVO */}
+          {/* 1. PROCURA INTELIGENTE DA FICHA ÚNICA DO RECLUSO PREVENTIVO */}
           {!selectedInmate ? (
             <div className="bg-[#10233f] p-3.5 rounded-2xl border border-blue-900/60 space-y-2.5">
-              <div className="relative">
-                <Search className="w-4 h-4 text-blue-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
-                <input
-                  type="text"
-                  value={searchTerm}
-                  onChange={(e) => setSearchTerm(e.target.value)}
-                  placeholder="Procurar Ficha Única (Nome, Matrícula, BI ou Processo)"
-                  aria-label="Procurar Ficha Única"
-                  className="w-full bg-[#0b192c] border border-blue-800/80 rounded-xl pl-9 pr-3 py-2 text-white placeholder:text-slate-500 focus:outline-none focus:border-amber-500"
-                />
+              <div className="text-[11px] text-slate-300">
+                Localize o recluso em estado <strong>PREVENTIVO</strong> ou <strong>RECORRENTE</strong> para atualizar a mesma FUR sem duplicar dados pessoais.
               </div>
-
-              {eligiblePreventives.length === 0 ? (
-                <div className="p-4 text-center text-slate-400 bg-[#0b192c] rounded-xl border border-slate-800">
-                  Sem reclusos preventivos elegíveis nesta jurisdição.
-                </div>
+              {hydrating ? (
+                <div className="p-5 text-center text-blue-300">A carregar Ficha Única do servidor...</div>
               ) : (
-                <div className="space-y-1.5 max-h-56 overflow-y-auto">
-                  {eligiblePreventives.map((inm) => (
-                    <button
-                      key={inm.inmateId}
-                      type="button"
-                      onClick={() => handleSelectInmate(inm)}
-                      className="w-full text-left bg-[#0b192c] hover:bg-[#132847] border border-blue-900/60 hover:border-amber-500/60 p-2.5 rounded-xl flex items-center justify-between gap-2 transition-all cursor-pointer"
-                    >
-                      <div className="flex items-center gap-2.5 min-w-0">
-                        <img
-                          src={inm.profile.photoUrl}
-                          alt={inm.profile.fullName}
-                          className="w-9 h-9 rounded-lg object-cover border border-slate-700 shrink-0"
-                        />
-                        <div className="min-w-0">
-                          <div className="font-bold text-white truncate">{inm.profile.fullName}</div>
-                          <div className="text-[11px] text-slate-400 font-mono truncate">
-                            {inm.profile.matricula} · {inm.admission.processNumber}
-                          </div>
-                        </div>
-                      </div>
-                      <span className="text-[10px] bg-amber-500/20 text-amber-300 border border-amber-500/40 px-2 py-0.5 rounded-full font-bold shrink-0">
-                        {inm.legal.legalStatus}
-                      </span>
-                    </button>
-                  ))}
-                </div>
+                <InmateSmartFinder
+                  currentUser={currentUser}
+                  provinceId={currentProvinceId}
+                  apiActive={apiActive}
+                  custodyScope="PREVENTIVO"
+                  restrictToOperableJurisdiction={true}
+                  onSelect={handleSelectIndexItem}
+                  placeholder="Procurar Ficha Única (matrícula, nome, BI, processo, cela, parente)..."
+                  emptyHint="Sem reclusos preventivos elegíveis nesta jurisdição."
+                />
               )}
             </div>
           ) : (
@@ -260,13 +305,13 @@ export const TransicaoModal: React.FC<TransicaoModalProps> = ({
                         <span className="truncate">{selectedInmate.profile.fullName}</span>
                       </div>
                       <div className="text-[11px] text-blue-300 font-mono truncate">
-                        {selectedInmate.profile.matricula} · BI {selectedInmate.profile.biNumber}
+                        {selectedInmate.profile.matricula} · BI {selectedInmate.profile.biNumber || 'N/D'} · v{selectedInmate.version || 1}
                       </div>
                     </div>
                   </div>
                   <button
                     type="button"
-                    onClick={() => setSelectedInmateId('')}
+                    onClick={() => setSelectedInmate(null)}
                     className="text-[11px] bg-slate-800 hover:bg-slate-700 text-slate-300 px-2.5 py-1 rounded-lg cursor-pointer shrink-0"
                   >
                     Trocar
@@ -397,7 +442,8 @@ export const TransicaoModal: React.FC<TransicaoModalProps> = ({
                 <div className="pt-1 flex justify-end">
                   <button
                     type="submit"
-                    className="bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold px-4 py-2 rounded-xl text-xs flex items-center gap-1.5 cursor-pointer shadow"
+                    disabled={busy}
+                    className="bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold px-4 py-2 rounded-xl text-xs flex items-center gap-1.5 cursor-pointer shadow disabled:opacity-50"
                   >
                     <CheckCircle2 className="w-4 h-4" />
                     <span>Actualizar Ficha Única ➔ CONDENADO</span>

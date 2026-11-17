@@ -1,13 +1,19 @@
 /**
  * PNAP - Sistema Nacional de Administração Prisional (República de Angola)
- * Tipagens estritas baseadas na hierarquia do sistema e RDPA 2024 (21 Províncias)
+ * Tipagens estritas baseadas na hierarquia do sistema, RDPA 2024 (21 Províncias)
+ * e Arquitetura Oficial da Ficha Única do Recluso (FUR) + Motor de Estados.
  */
 
-export type UserRole = 
-  | 'CENTRAL_ADMIN'        // Direcção Geral Nacional PNAP (Acesso irrestrito a todas as províncias)
-  | 'PROVINCIAL_COMMAND'   // Comando Provincial (ex: Luanda) - Acesso estrito à sua província
+export type UserRole =
+  | 'CENTRAL_ADMIN'          // Direcção Geral Nacional PNAP (Acesso irrestrito a todas as províncias)
+  | 'PROVINCIAL_COMMAND'     // Comando Provincial (ex: Luanda) - Acesso estrito à sua província
   | 'ESTABLISHMENT_DIRECTOR' // Director de Comarca/Penitenciária
-  | 'OPERATIONAL_OFFICER';  // Oficial Operacional / Portaria / Registo
+  | 'OPERATIONAL_OFFICER'    // Oficial Operacional / Portaria / Registo (compatibilidade legada)
+  | 'PENAL_CONTROL'          // Oficial de Controlo Penal (Admissões, Processos, Transições, Transferências)
+  | 'HEALTH_SPECIALIST'      // Técnico/Médico de Saúde Prisional (Sigilo Clínico estrito)
+  | 'REHABILITATION'         // Reabilitador / Psicossocial / Classificação e Alojamento
+  | 'GATE_SECURITY'          // Oficial de Portaria / Escolta / Visitas e Movimentação Física
+  | 'AUDITOR_INSPECTOR';     // Auditor / Inspector Nacional ou Provincial (Leitura & Auditoria)
 
 export interface UserAssignment {
   role: UserRole;
@@ -33,7 +39,7 @@ export interface PnapUser {
 }
 
 // 21 Províncias segundo a Nova Divisão Político-Administrativa (RDPA 2024)
-export type ProvinceId = 
+export type ProvinceId =
   | 'luanda'
   | 'icolo_e_bengo'
   | 'bengo'
@@ -122,10 +128,174 @@ export interface EstablishmentProfile {
   homologationDecreeNumber?: string;
 }
 
+// --- MOTOR DE ESTADOS DA FICHA ÚNICA DO RECLUSO (FUR) ---
+
+/**
+ * Eixo 1 (Físico / Custódia): Estado real da custódia e ocupação de vaga.
+ * Ortogonal à situação jurídico-penal (Eixo 2).
+ */
+export type CustodyState =
+  | 'PRE_ADMISSAO'
+  | 'ATIVO_NA_UNIDADE'
+  | 'EM_DILIGENCIA_EXTERNA'
+  | 'HOSPITALIZADO_EXTERNO'
+  | 'EM_TRANSITO_TRANSFERENCIA'
+  | 'LIBERTADO'
+  | 'EVADIDO'
+  | 'FALECIDO';
+
+/**
+ * Eixo 2 (Jurídico-Penal): Situação processual consolidada sobre N processos ativos.
+ */
+export type LegalStatus =
+  | 'PREVENTIVO'
+  | 'CONDENADO'
+  | 'RECORRENTE'
+  | 'TRANSITO_EM_JULGADO'
+  | 'EXTINTO';
+
+/**
+ * Estado legado na UI/API (mantido para compatibilidade retroativa durante migração progressiva)
+ */
+export type LegacyCustodyStatus = 'ATIVO' | 'TRANSFERIDO' | 'LIBERTADO' | 'EVADIDO' | 'FALECIDO';
+
+/**
+ * Melhoria 1: Bloqueio de Identidade Única Nacional (previne duplicação de matrícula/BI em reentradas ou recapturas)
+ */
+export interface IdentityLock {
+  lockKey: string; // ex: BI normalizado ou chave composta nacional
+  inmateId: string;
+  matricula: string;
+  normalizedBiNumber: string;
+  fullNameNormalized: string;
+  activeCustodyState: CustodyState;
+  lastUpdated: string;
+}
+
+/**
+ * Melhoria 2 & 3: Processo Judicial Individual (1 recluso pode ter N processos simultâneos).
+ * A soltura definitiva é bloqueada se existir qualquer processo com isActive === true.
+ */
+export interface JudicialProcess {
+  processId: string;
+  inmateId: string;
+  provinceId: ProvinceId;
+  establishmentId: string;
+  processNumber: string;
+  courtName: string;
+  judgeName?: string;
+  crimeCategory: string;
+  penalCodeArticle: string;
+  legalStatus: LegalStatus;
+  regime?: 'FECHADO' | 'SEMI_ABERTO' | 'ABERTO';
+  sentenceAcordaoNumber?: string;
+  sentenceDate?: string;
+  transitDate?: string;
+  totalSentenceYears: number;
+  totalSentenceMonths: number;
+  startDate: string;
+  endOfSentenceDate?: string;
+  eligibleParoleDate?: string;
+  isActive: boolean;
+  extintionReason?: string;
+  extintionDate?: string;
+  updatedAt: string;
+  updatedBy: string;
+}
+
+/**
+ * Melhoria 6: Projeção não-clínica para a raiz da FUR (sem diagnósticos ou patologias sensíveis).
+ * Visível operacionalmente para segurança e alocação segura de cela/dieta.
+ */
+export interface HealthAlertSummary {
+  hasActiveAlerts: boolean;
+  infectiousRisk: boolean;
+  suicideRisk: boolean;
+  mobilityRestricted: boolean;
+  allergyFlags: string[];
+  dietFlags: string[];
+  specialUnitRecommended?: boolean;
+  lastTriagedAt?: string;
+}
+
+/**
+ * Melhoria 6: Registo Clínico Isolado em Subcoleção (/pnap_inmates/{inmateId}/health_records/{recordId}).
+ * Leitura e escrita estritamente bloqueadas para perfis não-HEALTH_SPECIALIST.
+ */
+export interface HealthRecord {
+  recordId: string;
+  inmateId: string;
+  provinceId: ProvinceId;
+  establishmentId: string;
+  bloodType?: string;
+  clinicalDiagnosis: string;
+  chronicDiseases: string[];
+  prescribedMedication: string[];
+  mentalHealthNotes: string;
+  clinicalObservations: string;
+  triageOutcome: 'APTO_COMUM' | 'ISOLAMENTO_SANITARIO' | 'ENFERMARIA' | 'HOSPITAL_EXTERNO';
+  recordedByUid: string;
+  recordedByName: string;
+  recordedAt: string;
+}
+
+export type MovementType =
+  | 'SAIDA_DILIGENCIA'
+  | 'RETORNO_DILIGENCIA'
+  | 'HOSPITALIZACAO_EXTERNA'
+  | 'RETORNO_HOSPITAL'
+  | 'TRANSFERENCIA_DESPACHO'
+  | 'TRANSFERENCIA_RECEPCAO'
+  | 'RECAPTURA'
+  | 'EVASAO'
+  | 'OBITO'
+  | 'SOLTURA_DEFINITIVA';
+
+/**
+ * Melhorias 4 & 5: Registo de Movimentação Física (diligências, transferências em 2 etapas, recaptura).
+ */
+export interface MovementRecord {
+  movementId: string;
+  inmateId: string;
+  provinceId: ProvinceId;
+  establishmentId: string;
+  type: MovementType;
+  documentNumber: string;
+  authorityOrEscort: string;
+  destinationLabel?: string;
+  targetProvinceId?: ProvinceId;
+  targetEstablishmentId?: string;
+  targetPavilionId?: string;
+  targetBlockId?: string;
+  targetCellId?: string;
+  reserveOriginCell: boolean;
+  timestamp: string;
+  registeredByUid: string;
+  registeredByName: string;
+  notes?: string;
+}
+
+/**
+ * Catálogo Dinâmico Configurável (/pnap_catalogs/{catalogId})
+ */
+export interface PnapCatalog {
+  catalogId: string;
+  category: 'CRIMES' | 'INCIDENTS' | 'EXIT_REASONS' | 'ESCORT_PROTOCOLS' | 'REHAB_PROGRAMS';
+  items: Array<{
+    code: string;
+    label: string;
+    active: boolean;
+    severity?: string;
+  }>;
+  updatedAt: string;
+  updatedBy: string;
+}
+
 // Transição Jurídico-Penal: Mudança de estado do recluso (Detido/Preventivo → Condenado com trânsito em julgado)
 export interface LegalTransitionRecord {
   transitionId: string;
   inmateId: string;
+  processId?: string;
   inmateName: string;
   matricula: string;
   provinceId: ProvinceId;
@@ -177,7 +347,7 @@ export interface InmateAdmission {
 }
 
 export interface InmateLegal {
-  legalStatus: 'PREVENTIVO' | 'CONDENADO' | 'RECORRENTE' | 'TRANSITO_EM_JULGADO';
+  legalStatus: Exclude<LegalStatus, 'EXTINTO'>;
   crimeCategory: string; // ex: Roubo Qualificado, Homicídio, Burla por Defraudação
   penalCodeArticle: string;
   totalSentenceYears: number;
@@ -204,12 +374,15 @@ export interface InmateRehabilitation {
   coursesEnrolled: string[];
   meritPoints: number;
   conductClassification: 'MUITO_BOM' | 'BOM' | 'REGULAR' | 'MAU';
+  riskLevel?: 'BAIXO' | 'MEDIO' | 'ALTO' | 'MAXIMO';
+  cellCompatibilityFlags?: string[];
 }
 
 export interface InmateDisciplinary {
   infractionsCount: number;
   lastInfractionDate?: string;
   activeSanction?: string;
+  visitsBlockedUntil?: string;
   sanctionHistory: Array<{
     date: string;
     description: string;
@@ -226,6 +399,35 @@ export interface InmateIncident {
   description: string;
   actionsTaken: string;
   reportedBy: string;
+  source?: 'INTERNO' | 'VISITA';
+  visitorId?: string;
+  visitorName?: string;
+  visitorBi?: string;
+}
+
+export interface InmateVisitor {
+  visitorId: string;
+  fullName: string;
+  biNumber: string;
+  phone: string;
+  relationship: string;
+  status: 'AUTORIZADO' | 'SUSPENSO';
+  registeredAt: string;
+  registeredBy: string;
+  lastVisitDate?: string;
+  suspendedReason?: string;
+}
+
+export interface InmateVisit {
+  visitId: string;
+  visitorId: string;
+  visitorName: string;
+  visitorBi?: string;
+  date: string;
+  timeSlot: string;
+  inspectionPassed: boolean;
+  dutyOfficer: string;
+  notes?: string;
 }
 
 export interface InmatePostInstitutional {
@@ -243,7 +445,7 @@ export interface InmateDocument {
   fileSize: string;
 }
 
-// O Recluso Completo (Armazenado na província e estabelecimento)
+// A Ficha Única do Recluso (FUR) Completa (Armazenada na província e estabelecimento)
 export interface Inmate {
   inmateId: string;
   provinceId: ProvinceId;
@@ -260,7 +462,20 @@ export interface Inmate {
   incidents: InmateIncident[];
   postInstitutional: InmatePostInstitutional;
   documents: InmateDocument[];
-  currentStatus: 'ATIVO' | 'TRANSFERIDO' | 'LIBERTADO' | 'EVADIDO' | 'FALECIDO';
+  visitors?: InmateVisitor[];
+  visits?: InmateVisit[];
+  currentStatus: LegacyCustodyStatus;
+  // Campos da Máquina de Estados Formal & 8 Melhorias (Fase 1)
+  version?: number; // Controlo de concorrência otimista (obrigatório em transações Phase 2+)
+  custodyState?: CustodyState; // Estado físico formal ortogonal ao jurídico
+  consolidatedLegalStatus?: LegalStatus; // Consolidação automática dos N processos judiciais
+  activeProcessesCount?: number; // Bloqueia soltura definitiva se > 0
+  identityLockKey?: string; // Referência para /pnap_identity_locks/{lockKey}
+  healthAlerts?: HealthAlertSummary; // Projeção operacional não-clínica
+  pendingTransferId?: string; // Guia de transferência ativa em trânsito
+  lastMovementAt?: string;
+  updatedAt?: string;
+  updatedBy?: string;
 }
 
 // ÍNDICE NACIONAL DE RECLUSOS (nationalInmateIndex)
@@ -277,7 +492,8 @@ export interface NationalInmateIndexItem {
   establishmentName: string;
   pavilionName: string;
   cellCode: string;
-  legalStatus: 'PREVENTIVO' | 'CONDENADO' | 'RECORRENTE' | 'TRANSITO_EM_JULGADO';
+  processNumber?: string;
+  legalStatus: Exclude<LegalStatus, 'EXTINTO'>;
   crimeCategory: string;
   penalCodeArticle: string;
   parentName: string; // Nome de Parente (Pai/Mãe)
@@ -286,7 +502,11 @@ export interface NationalInmateIndexItem {
   neighborhood: string; // Bairro
   photoUrl: string;
   lastUpdated: string;
-  custodyStatus?: 'ATIVO' | 'TRANSFERIDO' | 'LIBERTADO' | 'EVADIDO' | 'FALECIDO';
+  custodyStatus?: LegacyCustodyStatus;
+  custodyState?: CustodyState;
+  version?: number;
+  visitorKeywords?: string;
+  searchText?: string;
 }
 
 export interface TransferRecord {
@@ -300,6 +520,14 @@ export interface TransferRecord {
   destinationEstablishmentId: string;
   requestDate: string;
   status: 'PENDENTE' | 'AUTORIZADO_CENTRAL' | 'EM_TRANSITO' | 'CONCLUIDO' | 'REJEITADO';
+  stage?: 'DISPATCHED' | 'RECEIVED' | 'CANCELLED';
+  dispatchedAt?: string;
+  dispatchedBy?: string;
+  receivedAt?: string;
+  receivedBy?: string;
+  targetPavilionId?: string;
+  targetBlockId?: string;
+  targetCellId?: string;
   justification: string;
   securityEscort: string;
   authorizedBy: string;
@@ -345,6 +573,7 @@ export interface ReleaseRecord {
   notes?: string;
   registeredBy: string;
   registeredAt?: string;
+  approvedByDirector?: string; // Melhoria 3: dupla verificação / 4-olhos
 }
 
 export interface VisitorRecord {
@@ -367,6 +596,7 @@ export interface VisitRecord {
   visitorName: string;
   inmateId: string;
   inmateName: string;
+  provinceId?: ProvinceId;
   establishmentId: string;
   date: string;
   timeSlot: string;
@@ -386,6 +616,10 @@ export interface AuditLogEvent {
   details: string;
   ipAddress: string;
   jurisdictionStatus: 'AUTHORIZED' | 'CROSS_PROVINCE_QUERY' | 'BLOCKED_ATTEMPT';
+  previousState?: string;
+  newState?: string;
+  expectedVersion?: number;
+  resultingVersion?: number;
 }
 
 export interface PnapSystem {

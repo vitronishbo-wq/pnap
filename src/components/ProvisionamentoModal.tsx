@@ -3,6 +3,12 @@ import { ProvinceId, PnapUser, EstablishmentProfile, Pavilion, Block, Cell } fro
 import { PROVINCES_DATA } from '../data/mockPnapData';
 import { pnapStore } from '../services/pnapStore';
 import {
+  fetchApiProvinceStats,
+  fetchProvinceEstablishmentsViaApi,
+  homologateEstablishmentViaApi,
+  saveDraftEstablishmentViaApi
+} from '../services/apiClient';
+import {
   Building2,
   Plus,
   CheckCircle2,
@@ -16,6 +22,7 @@ import {
 
 interface ProvisionamentoModalProps {
   currentUser: PnapUser;
+  apiActive?: boolean;
   onClose: () => void;
   presetProvinceId?: ProvinceId;
 }
@@ -46,6 +53,7 @@ const createEmptyPavilion = (): Pavilion => ({
 
 export const ProvisionamentoModal: React.FC<ProvisionamentoModalProps> = ({
   currentUser,
+  apiActive = false,
   onClose,
   presetProvinceId
 }) => {
@@ -58,6 +66,7 @@ export const ProvisionamentoModal: React.FC<ProvisionamentoModalProps> = ({
   const [feedback, setFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [targetEstForHomologation, setTargetEstForHomologation] = useState<EstablishmentProfile | null>(null);
   const [decreeNumber, setDecreeNumber] = useState('');
+  const [busy, setBusy] = useState(false);
 
   const getBlockCapacity = (blk: Block) =>
     blk.cells.reduce((sum, c) => sum + (Number(c.capacity) || 0), 0);
@@ -208,25 +217,40 @@ export const ProvisionamentoModal: React.FC<ProvisionamentoModalProps> = ({
   };
 
   // FASE 1: Rascunho (permite estado incompleto)
-  const handleSaveDraft = () => {
+  const handleSaveDraft = async () => {
     if (!selectedProvince) {
       setFeedback({ type: 'err', text: 'Selecione a província.' });
       return;
     }
 
     const payload = buildEstablishmentPayload(selectedProvince);
-    const result = pnapStore.saveDraftEstablishment(currentUser, payload);
+    if (!apiActive) {
+      const result = pnapStore.saveDraftEstablishment(currentUser, payload);
+      if (result.success && result.establishment) {
+        setEditingEstId(result.establishment.establishmentId);
+        setFeedback({ type: 'ok', text: result.message });
+      } else {
+        setFeedback({ type: 'err', text: result.message });
+      }
+      return;
+    }
 
-    if (result.success && result.establishment) {
-      setEditingEstId(result.establishment.establishmentId);
-      setFeedback({ type: 'ok', text: result.message });
-    } else {
-      setFeedback({ type: 'err', text: result.message });
+    setBusy(true);
+    try {
+      const res = await saveDraftEstablishmentViaApi(payload);
+      const listRes = await fetchProvinceEstablishmentsViaApi(selectedProvince);
+      pnapStore.syncLiveEstablishments(selectedProvince, listRes.establishments);
+      setEditingEstId(res.establishment.establishmentId);
+      setFeedback({ type: 'ok', text: res.message });
+    } catch (err) {
+      setFeedback({ type: 'err', text: err instanceof Error ? err.message : 'Erro ao gravar rascunho.' });
+    } finally {
+      setBusy(false);
     }
   };
 
   // Pré-validação para abrir despacho de homologação
-  const handleOpenHomologation = () => {
+  const handleOpenHomologation = async () => {
     if (!selectedProvince) {
       setFeedback({ type: 'err', text: 'Selecione a província.' });
       return;
@@ -267,37 +291,80 @@ export const ProvisionamentoModal: React.FC<ProvisionamentoModalProps> = ({
     }
 
     const payload = buildEstablishmentPayload(selectedProvince);
-    const saved = pnapStore.saveDraftEstablishment(currentUser, payload);
-    if (!saved.success || !saved.establishment) {
-      setFeedback({ type: 'err', text: saved.message });
+    if (!apiActive) {
+      const saved = pnapStore.saveDraftEstablishment(currentUser, payload);
+      if (!saved.success || !saved.establishment) {
+        setFeedback({ type: 'err', text: saved.message });
+        return;
+      }
+      setEditingEstId(saved.establishment.establishmentId);
+      setFeedback(null);
+      setDecreeNumber('');
+      setTargetEstForHomologation(saved.establishment);
       return;
     }
 
-    setEditingEstId(saved.establishment.establishmentId);
-    setFeedback(null);
-    setDecreeNumber('');
-    setTargetEstForHomologation(saved.establishment);
+    setBusy(true);
+    try {
+      const saved = await saveDraftEstablishmentViaApi(payload);
+      setEditingEstId(saved.establishment.establishmentId);
+      setFeedback(null);
+      setDecreeNumber('');
+      setTargetEstForHomologation(saved.establishment);
+    } catch (err) {
+      setFeedback({ type: 'err', text: err instanceof Error ? err.message : 'Erro ao preparar homologação.' });
+    } finally {
+      setBusy(false);
+    }
   };
 
-  const handleConfirmHomologation = () => {
+  const handleConfirmHomologation = async () => {
     if (!targetEstForHomologation) return;
 
-    const result = pnapStore.homologateEstablishment(
-      currentUser,
-      targetEstForHomologation.provinceId,
-      targetEstForHomologation.establishmentId,
-      decreeNumber
-    );
+    if (!apiActive) {
+      const result = pnapStore.homologateEstablishment(
+        currentUser,
+        targetEstForHomologation.provinceId,
+        targetEstForHomologation.establishmentId,
+        decreeNumber
+      );
 
-    if (result.success) {
+      if (result.success) {
+        setTargetEstForHomologation(null);
+        setEditingEstId(null);
+        setEstName('');
+        setPavilions([createEmptyPavilion()]);
+        setFeedback({ type: 'ok', text: result.message });
+        setActiveTab('list');
+      } else {
+        setFeedback({ type: 'err', text: result.message });
+      }
+      return;
+    }
+
+    setBusy(true);
+    try {
+      const res = await homologateEstablishmentViaApi(
+        targetEstForHomologation.provinceId,
+        targetEstForHomologation.establishmentId,
+        decreeNumber
+      );
+      const [listRes, statsRes] = await Promise.all([
+        fetchProvinceEstablishmentsViaApi(targetEstForHomologation.provinceId),
+        fetchApiProvinceStats()
+      ]);
+      pnapStore.syncLiveEstablishments(targetEstForHomologation.provinceId, listRes.establishments);
+      pnapStore.syncLiveProvinceStats(statsRes.stats);
       setTargetEstForHomologation(null);
       setEditingEstId(null);
       setEstName('');
       setPavilions([createEmptyPavilion()]);
-      setFeedback({ type: 'ok', text: result.message });
+      setFeedback({ type: 'ok', text: res.message });
       setActiveTab('list');
-    } else {
-      setFeedback({ type: 'err', text: result.message });
+    } catch (err) {
+      setFeedback({ type: 'err', text: err instanceof Error ? err.message : 'Erro ao homologar estabelecimento.' });
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -685,8 +752,9 @@ export const ProvisionamentoModal: React.FC<ProvisionamentoModalProps> = ({
           <div className="bg-[#0e2038] px-3 py-2.5 sm:px-4 border-t border-blue-900/60 flex items-center justify-end gap-2 shrink-0">
             <button
               type="button"
-              onClick={handleSaveDraft}
-              className="flex-1 sm:flex-none bg-[#132847] hover:bg-[#1a3863] text-blue-200 border border-blue-700/80 px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 cursor-pointer"
+              disabled={busy}
+              onClick={() => void handleSaveDraft()}
+              className="flex-1 sm:flex-none bg-[#132847] hover:bg-[#1a3863] disabled:opacity-50 text-blue-200 border border-blue-700/80 px-3.5 py-2 rounded-xl text-xs font-semibold flex items-center justify-center gap-1.5 cursor-pointer"
             >
               <Save className="w-3.5 h-3.5" />
               <span>Rascunho</span>
@@ -694,8 +762,9 @@ export const ProvisionamentoModal: React.FC<ProvisionamentoModalProps> = ({
 
             <button
               type="button"
-              onClick={handleOpenHomologation}
-              className="flex-1 sm:flex-none bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-4 py-2 rounded-xl text-xs flex items-center justify-center gap-1.5 cursor-pointer shadow-lg"
+              disabled={busy}
+              onClick={() => void handleOpenHomologation()}
+              className="flex-1 sm:flex-none bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold px-4 py-2 rounded-xl text-xs flex items-center justify-center gap-1.5 cursor-pointer shadow-lg"
             >
               <FileCheck2 className="w-3.5 h-3.5" />
               <span>Homologar</span>
@@ -737,18 +806,20 @@ export const ProvisionamentoModal: React.FC<ProvisionamentoModalProps> = ({
               <div className="flex items-center justify-end gap-2 pt-1">
                 <button
                   type="button"
+                  disabled={busy}
                   onClick={() => setTargetEstForHomologation(null)}
-                  className="bg-slate-800 hover:bg-slate-700 text-slate-300 px-3 py-2 rounded-xl text-xs cursor-pointer"
+                  className="bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-300 px-3 py-2 rounded-xl text-xs cursor-pointer"
                 >
                   Cancelar
                 </button>
                 <button
                   type="button"
-                  onClick={handleConfirmHomologation}
-                  className="bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-4 py-2 rounded-xl text-xs flex items-center gap-1.5 cursor-pointer"
+                  disabled={busy}
+                  onClick={() => void handleConfirmHomologation()}
+                  className="bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold px-4 py-2 rounded-xl text-xs flex items-center gap-1.5 cursor-pointer"
                 >
                   <CheckCircle2 className="w-3.5 h-3.5" />
-                  <span>Confirmar</span>
+                  <span>{busy ? 'A homologar...' : 'Confirmar'}</span>
                 </button>
               </div>
             </div>

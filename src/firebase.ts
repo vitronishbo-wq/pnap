@@ -2,6 +2,8 @@ import { initializeApp } from 'firebase/app';
 import {
   getAuth,
   GoogleAuthProvider,
+  multiFactor,
+  reauthenticateWithPopup,
   signInWithPopup,
   signOut,
   type User
@@ -90,6 +92,34 @@ export async function signInWithGoogle(): Promise<User> {
   return result.user;
 }
 
+export async function reauthenticateWithGoogle(): Promise<User> {
+  const provider = new GoogleAuthProvider();
+  provider.setCustomParameters({ prompt: 'login' });
+  if (!auth.currentUser) {
+    const result = await signInWithPopup(auth, provider);
+    return result.user;
+  }
+  const result = await reauthenticateWithPopup(auth.currentUser, provider);
+  return result.user;
+}
+
+export function getEnrolledMfaInfo(user: User | null): { count: number; factors: Array<{ uid: string; factorId: string; displayName?: string | null }> } {
+  if (!user) return { count: 0, factors: [] };
+  try {
+    const enrolled = multiFactor(user).enrolledFactors || [];
+    return {
+      count: enrolled.length,
+      factors: enrolled.map((f) => ({
+        uid: f.uid,
+        factorId: f.factorId,
+        displayName: f.displayName
+      }))
+    };
+  } catch {
+    return { count: 0, factors: [] };
+  }
+}
+
 export async function signOutFirebase(): Promise<void> {
   await signOut(auth);
 }
@@ -109,3 +139,32 @@ export async function fetchAuthenticatedPnapUser(uid: string): Promise<PnapUser 
     handleFirestoreError(error, OperationType.GET, path);
   }
 }
+
+export async function checkAdminGateFirestore(uid: string): Promise<{
+  hasAdminDoc: boolean;
+  adminRole?: string;
+  pnapUser: PnapUser | null;
+}> {
+  const adminPath = `pnap_admins/${uid}`;
+  let hasAdminDoc = false;
+  let adminRole: string | undefined;
+
+  try {
+    const adminSnap = await getDoc(doc(db, 'pnap_admins', uid));
+    if (adminSnap.exists()) {
+      hasAdminDoc = true;
+      const data = adminSnap.data() as { role?: string };
+      adminRole = data.role;
+    }
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, adminPath);
+  }
+
+  const pnapUser = await fetchAuthenticatedPnapUser(uid);
+  return {
+    hasAdminDoc,
+    adminRole,
+    pnapUser
+  };
+}
+

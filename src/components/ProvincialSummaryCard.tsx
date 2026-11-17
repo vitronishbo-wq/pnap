@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
 import { ProvinceId, EstablishmentProfile } from '../types/pnap';
-import { PROVINCES_DATA, PROVINCE_STATISTICS, ESTABLISHMENTS_DATA } from '../data/mockPnapData';
-import { Building2, Users, AlertTriangle, ShieldCheck, ChevronRight, X, ArrowRight } from 'lucide-react';
+import { PROVINCES_DATA } from '../data/mockPnapData';
+import { pnapStore } from '../services/pnapStore';
+import { ChevronRight, X, ArrowRight } from 'lucide-react';
 
 interface ProvincialSummaryCardProps {
   provinceId: ProvinceId;
@@ -24,17 +25,9 @@ export const ProvincialSummaryCard: React.FC<ProvincialSummaryCardProps> = ({
     contactEmergency: '+244 222 000 000'
   };
 
-  const stats = PROVINCE_STATISTICS[provinceId] || {
-    activeInmates: 0,
-    totalCapacity: 0,
-    occupancyRate: 0,
-    availableSpots: 0,
-    establishmentsCount: 0,
-    preventiveCount: 0,
-    convictedCount: 0
-  };
+  const stats = pnapStore.getProvinceStats(provinceId);
 
-  const establishments: EstablishmentProfile[] = ESTABLISHMENTS_DATA[provinceId] || [];
+  const establishments: EstablishmentProfile[] = pnapStore.getEstablishments(provinceId);
 
   return (
     <>

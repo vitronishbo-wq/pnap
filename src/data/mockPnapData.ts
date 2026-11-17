@@ -1107,21 +1107,112 @@ export const MOCK_USERS: PnapUser[] = [
       uid: 'user-viana-01',
       fullName: 'Inspector-Chefe Paulo Quifuxi',
       badgeNumber: 'PNAP-EPV-109',
-      rank: 'Chefe de Turno / Estabelecimento de Viana',
+      rank: 'Director de Unidade / Comarca de Viana',
       phone: '+244 925 332 119',
-      email: 'turno.viana@pnap.gov.ao',
+      email: 'direcao.viana@pnap.gov.ao',
       status: 'active'
     },
     assignments: {
-      role: 'OPERATIONAL_OFFICER',
+      role: 'ESTABLISHMENT_DIRECTOR',
       assignedProvinceId: 'luanda',
       assignedEstablishmentId: 'comarca-viana',
       permissions: [
         'manage_intake_release',
+        'approve_release',
+        'manage_rehabilitation',
         'manage_visitors',
         'view_pavilion_cells',
         'query_national_index'
       ]
+    }
+  },
+  {
+    uid: 'user-penal-01',
+    profile: {
+      uid: 'user-penal-01',
+      fullName: 'Oficial Penal Carlos Morais',
+      badgeNumber: 'PNAP-PEN-214',
+      rank: 'Chefe de Controlo Penal / Viana',
+      phone: '+244 925 400 214',
+      email: 'penal.viana@pnap.gov.ao',
+      status: 'active'
+    },
+    assignments: {
+      role: 'PENAL_CONTROL',
+      assignedProvinceId: 'luanda',
+      assignedEstablishmentId: 'comarca-viana',
+      permissions: ['manage_intake_release', 'manage_legal_processes', 'query_national_index']
+    }
+  },
+  {
+    uid: 'user-saude-01',
+    profile: {
+      uid: 'user-saude-01',
+      fullName: 'Dra. Helena Caxito',
+      badgeNumber: 'PNAP-MED-088',
+      rank: 'Médica Prisional / Sigilo Clínico',
+      phone: '+244 923 880 088',
+      email: 'saude.viana@pnap.gov.ao',
+      status: 'active'
+    },
+    assignments: {
+      role: 'HEALTH_SPECIALIST',
+      assignedProvinceId: 'luanda',
+      assignedEstablishmentId: 'comarca-viana',
+      permissions: ['read_clinical_records', 'write_clinical_records']
+    }
+  },
+  {
+    uid: 'user-rehab-01',
+    profile: {
+      uid: 'user-rehab-01',
+      fullName: 'Téc. Júlia Ngola',
+      badgeNumber: 'PNAP-REH-302',
+      rank: 'Técnica de Reabilitação & Classificação',
+      phone: '+244 924 112 302',
+      email: 'rehabilitacao.viana@pnap.gov.ao',
+      status: 'active'
+    },
+    assignments: {
+      role: 'REHABILITATION',
+      assignedProvinceId: 'luanda',
+      assignedEstablishmentId: 'comarca-viana',
+      permissions: ['manage_rehabilitation', 'allocate_cell']
+    }
+  },
+  {
+    uid: 'user-gate-01',
+    profile: {
+      uid: 'user-gate-01',
+      fullName: 'Subinspetor André Kiala',
+      badgeNumber: 'PNAP-PRT-419',
+      rank: 'Oficial de Portaria & Escolta',
+      phone: '+244 926 771 419',
+      email: 'portaria.viana@pnap.gov.ao',
+      status: 'active'
+    },
+    assignments: {
+      role: 'GATE_SECURITY',
+      assignedProvinceId: 'luanda',
+      assignedEstablishmentId: 'comarca-viana',
+      permissions: ['manage_visitors', 'register_movements']
+    }
+  },
+  {
+    uid: 'user-auditor-01',
+    profile: {
+      uid: 'user-auditor-01',
+      fullName: 'Inspector Nacional Filomeno Bastos',
+      badgeNumber: 'PNAP-AUD-015',
+      rank: 'Auditor & Inspector-Geral',
+      phone: '+244 921 900 015',
+      email: 'auditoria@pnap.gov.ao',
+      status: 'active'
+    },
+    assignments: {
+      role: 'AUDITOR_INSPECTOR',
+      assignedProvinceId: 'all',
+      permissions: ['view_global_audit', 'query_national_index']
     }
   }
 ];

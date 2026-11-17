@@ -1,26 +1,26 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { NationalInmateIndexItem, UserRole } from '../types/pnap';
-import { NATIONAL_INMATE_INDEX, PROVINCES_DATA } from '../data/mockPnapData';
-import { 
-  Search, 
-  MapPin, 
-  Shield, 
-  User, 
-  Phone, 
-  Home, 
-  AlertCircle, 
-  FileText, 
-  Lock, 
-  CheckCircle, 
-  ArrowRight,
+import { NATIONAL_INMATE_INDEX } from '../data/mockPnapData';
+import { fetchNationalIndexViaApi } from '../services/apiClient';
+import {
+  Search,
+  MapPin,
+  Shield,
+  User,
+  Phone,
+  Home,
+  AlertCircle,
+  FileText,
+  Lock,
+  CheckCircle,
   Filter,
-  Eye,
   Send
 } from 'lucide-react';
 
 interface NationalInmateSearchProps {
   currentUserRole: UserRole;
   currentUserProvince: string;
+  apiActive?: boolean;
   onOpenInmateDossier: (inmateId: string) => void;
   onRequestTransfer: (inmate: NationalInmateIndexItem) => void;
   onClose?: () => void;
@@ -29,16 +29,37 @@ interface NationalInmateSearchProps {
 export const NationalInmateSearch: React.FC<NationalInmateSearchProps> = ({
   currentUserRole,
   currentUserProvince,
+  apiActive = false,
   onOpenInmateDossier,
   onRequestTransfer,
   onClose
 }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedFilterCategory, setSelectedFilterCategory] = useState<'all' | 'name' | 'matricula' | 'bi' | 'parent' | 'phone' | 'neighborhood' | 'province' | 'crime' | 'pavilion'>('all');
-  const [selectedInmate, setSelectedInmate] = useState<NationalInmateIndexItem | null>(null);
+  const [liveResults, setLiveResults] = useState<NationalInmateIndexItem[] | null>(null);
+
+  useEffect(() => {
+    if (!apiActive) {
+      setLiveResults(null);
+      return;
+    }
+    let mounted = true;
+    const timer = setTimeout(() => {
+      fetchNationalIndexViaApi(searchTerm, selectedFilterCategory)
+        .then((res) => {
+          if (mounted) setLiveResults(res.results);
+        })
+        .catch(() => {});
+    }, 200);
+    return () => {
+      mounted = false;
+      clearTimeout(timer);
+    };
+  }, [apiActive, searchTerm, selectedFilterCategory]);
 
   // Motor de busca federado multi-critério sobre o nationalInmateIndex
   const filteredInmates = useMemo(() => {
+    if (liveResults !== null) return liveResults;
     if (!searchTerm.trim()) return NATIONAL_INMATE_INDEX;
 
     const term = searchTerm.toLowerCase().trim();
@@ -77,11 +98,12 @@ export const NationalInmateSearch: React.FC<NationalInmateSearchProps> = ({
         matchPavilion
       );
     });
-  }, [searchTerm, selectedFilterCategory]);
+  }, [liveResults, searchTerm, selectedFilterCategory]);
 
   // Checar se o utilizador tem jurisdição direta ou é consulta transversal
   const isDirectJurisdiction = (inmate: NationalInmateIndexItem) => {
     if (currentUserRole === 'CENTRAL_ADMIN') return true;
+    if (currentUserRole === 'AUDITOR_INSPECTOR' && currentUserProvince === 'all') return true;
     return inmate.provinceId === currentUserProvince;
   };
 

@@ -10,17 +10,36 @@ import {
   AuditLogEvent,
   ProvinceStatistics,
   ExitModality,
-  ReleaseRecord
+  ReleaseRecord,
+  Inmate,
+  InmateIncident,
+  InmateVisit,
+  InmateVisitor,
+  AdmissionRecord,
+  VisitorRecord,
+  VisitRecord
 } from '../types/pnap';
 import { 
   ESTABLISHMENTS_DATA, 
+  PROVINCES_DATA,
   PROVINCE_STATISTICS, 
   INMATES_LOCAL_DB, 
   NATIONAL_INMATE_INDEX, 
   MOCK_AUDIT_LOGS,
   MOCK_TRANSFERS,
-  MOCK_RELEASES
+  MOCK_ADMISSIONS,
+  MOCK_RELEASES,
+  MOCK_VISITORS,
+  MOCK_VISITS
 } from '../data/mockPnapData';
+import { inmateToNationalIndexItem } from '../utils/inmateSearch';
+
+function isMeaningfulBi(bi?: string | null): boolean {
+  if (!bi) return false;
+  const cleaned = bi.trim().toUpperCase().replace(/[\s._-]+/g, '');
+  if (!cleaned) return false;
+  return !['PENDENTE', 'ND', 'SBI', 'SEMBI', 'NAODECLARADO', 'SEMNUMERO', 'UNKNOWN'].includes(cleaned);
+}
 
 // Initial Mock Transitions (Transição Processual: Detido/Preventivo -> Condenado)
 const INITIAL_LEGAL_TRANSITIONS: LegalTransitionRecord[] = [
@@ -81,6 +100,8 @@ export function computeStructureCapacities(establishment: EstablishmentProfile):
 class PnapStoreService {
   private establishments: Record<string, EstablishmentProfile[]> = {};
   private provinceStats: Record<string, ProvinceStatistics> = {};
+  private inmates: Inmate[] = [...INMATES_LOCAL_DB];
+  private admissions: AdmissionRecord[] = [...MOCK_ADMISSIONS];
   private legalTransitions: LegalTransitionRecord[] = [...INITIAL_LEGAL_TRANSITIONS];
   private physicalTransfers: TransferRecord[] = [...MOCK_TRANSFERS];
   private releases: ReleaseRecord[] = [...MOCK_RELEASES];
@@ -119,6 +140,9 @@ class PnapStoreService {
   // --- 1. REGRAS DE AUTORIZAÇÃO GLOBAL ---
   canOperateProvince(user: PnapUser, provinceId: string): boolean {
     if (user.assignments.role === 'CENTRAL_ADMIN') return true;
+    if (user.assignments.role === 'AUDITOR_INSPECTOR' && user.assignments.assignedProvinceId === 'all') {
+      return true;
+    }
     return user.assignments.assignedProvinceId === provinceId;
   }
 
@@ -126,7 +150,75 @@ class PnapStoreService {
     return user.assignments.role === 'CENTRAL_ADMIN';
   }
 
-  // --- 2. GETTERS ---
+  // --- 2. GETTERS & SINCRONIZAÇÃO LIVE API ---
+  getInmates(): Inmate[] {
+    return this.inmates;
+  }
+
+  getAdmissions(): AdmissionRecord[] {
+    return this.admissions;
+  }
+
+  private syncNationalIndexFromInmate(inmate: Inmate) {
+    const estList = this.establishments[inmate.provinceId] || [];
+    const estName =
+      estList.find((e) => e.establishmentId === inmate.establishmentId)?.name ||
+      inmate.establishmentId;
+    const provName = PROVINCES_DATA[inmate.provinceId]?.name || inmate.provinceId;
+    const idxItem = inmateToNationalIndexItem(inmate, estName, provName);
+    const existingIdx = NATIONAL_INMATE_INDEX.findIndex(
+      (item) => item.inmateId === inmate.inmateId
+    );
+    if (existingIdx >= 0) {
+      NATIONAL_INMATE_INDEX[existingIdx] = idxItem;
+    } else {
+      NATIONAL_INMATE_INDEX.unshift(idxItem);
+    }
+  }
+
+  upsertLiveInmate(inmate: Inmate) {
+    const idx = this.inmates.findIndex((i) => i.inmateId === inmate.inmateId);
+    if (idx >= 0) {
+      this.inmates[idx] = inmate;
+    } else {
+      this.inmates.unshift(inmate);
+    }
+    const localDbIdx = INMATES_LOCAL_DB.findIndex((i) => i.inmateId === inmate.inmateId);
+    if (localDbIdx >= 0) {
+      INMATES_LOCAL_DB[localDbIdx] = inmate;
+    } else {
+      INMATES_LOCAL_DB.unshift(inmate);
+    }
+    this.syncNationalIndexFromInmate(inmate);
+    this.notify();
+  }
+
+  syncLiveInmates(provinceId: ProvinceId, liveInmates: Inmate[]) {
+    const others = this.inmates.filter((i) => i.provinceId !== provinceId);
+    this.inmates = [...liveInmates, ...others];
+    this.notify();
+  }
+
+  syncLiveTransfers(transfers: TransferRecord[]) {
+    this.physicalTransfers = transfers;
+    this.notify();
+  }
+
+  syncLiveAuditLogs(logs: AuditLogEvent[]) {
+    this.auditLogs = logs;
+    this.notify();
+  }
+
+  syncLiveProvinceStats(statsMap: Record<string, ProvinceStatistics>) {
+    this.provinceStats = { ...this.provinceStats, ...statsMap };
+    this.notify();
+  }
+
+  syncLiveEstablishments(provinceId: ProvinceId, list: EstablishmentProfile[]) {
+    this.establishments[provinceId] = list;
+    this.notify();
+  }
+
   getEstablishments(provinceId: string): EstablishmentProfile[] {
     return this.establishments[provinceId] || [];
   }
@@ -482,11 +574,10 @@ class PnapStoreService {
     this.legalTransitions.unshift(newTransition);
 
     // Atualiza o índice nacional federado
-    const targetIndex = NATIONAL_INMATE_INDEX.find((item) => item.inmateId === targetInmate.inmateId);
-    if (targetIndex) {
-      targetIndex.legalStatus = 'CONDENADO';
-      targetIndex.lastUpdated = new Date().toISOString();
-    }
+    targetInmate.version = (targetInmate.version || 1) + 1;
+    targetInmate.updatedAt = new Date().toISOString();
+    targetInmate.updatedBy = user.profile.fullName;
+    this.syncNationalIndexFromInmate(targetInmate);
 
     // Atualiza estatísticas processuais da província (Preventivo -> Condenado)
     const provStats = this.provinceStats[targetInmate.provinceId];
@@ -635,12 +726,17 @@ class PnapStoreService {
       };
     }
 
-    // Impedir saídas duplicadas e dupla contabilização
-    const alreadyExited = this.releases.some((r) => r.inmateId === inmate.inmateId);
-    if (inmate.currentStatus !== 'ATIVO' || alreadyExited) {
+    // Impedir saídas duplicadas caso o recluso já não esteja em custódia ativa
+    const activeCustody =
+      inmate.custodyState
+        ? ['ATIVO_NA_UNIDADE', 'EM_DILIGENCIA_EXTERNA', 'HOSPITALIZADO_EXTERNO'].includes(
+            inmate.custodyState
+          )
+        : inmate.currentStatus === 'ATIVO';
+    if (!activeCustody || inmate.currentStatus !== 'ATIVO') {
       return {
         success: false,
-        message: `Saída duplicada bloqueada: ${inmate.profile.fullName} já não se encontra em estado ATIVO (${inmate.currentStatus}).`
+        message: `Saída duplicada bloqueada: ${inmate.profile.fullName} já não se encontra em estado ATIVO (${inmate.custodyState || inmate.currentStatus}).`
       };
     }
 
@@ -658,13 +754,14 @@ class PnapStoreService {
 
     // 1. Atualizar estado do recluso preservando integralmente o histórico de admissão
     inmate.currentStatus = resultingStatus;
+    inmate.custodyState =
+      resultingStatus === 'TRANSFERIDO' ? 'EM_TRANSITO_TRANSFERENCIA' : resultingStatus;
+    inmate.version = (inmate.version || 1) + 1;
+    inmate.updatedAt = nowIso;
+    inmate.updatedBy = user.profile.fullName;
 
     // 2. Atualizar NATIONAL_INMATE_INDEX
-    const indexItem = NATIONAL_INMATE_INDEX.find((item) => item.inmateId === inmate.inmateId);
-    if (indexItem) {
-      indexItem.custodyStatus = resultingStatus;
-      indexItem.lastUpdated = nowIso;
-    }
+    this.syncNationalIndexFromInmate(inmate);
 
     // 3. Recalcular ocupação da unidade de origem (sem alterar capacidade física)
     const provinceEstablishments = this.establishments[inmate.provinceId] || [];
@@ -780,6 +877,673 @@ class PnapStoreService {
       success: true,
       message: `Saída registada (${exitData.modality} ➔ ${resultingStatus}): ${inmate.profile.fullName}.`,
       record: newRelease
+    };
+  }
+
+  // --- 7. ADMISSÃO (CONFLITO NACIONAL BI/MATRÍCULA + REENTRADA NA MESMA FUR), RECAPTURA & RECEPÇÃO ---
+  admitInmateOffline(
+    user: PnapUser,
+    input: {
+      provinceId: ProvinceId;
+      establishmentId: string;
+      fullName: string;
+      matricula: string;
+      biNumber: string;
+      gender: 'M' | 'F';
+      courtName: string;
+      crimeCategory: string;
+      processNumber: string;
+      reentry?: boolean;
+      existingInmateId?: string;
+    }
+  ): { success: boolean; message: string; inmate?: Inmate; admission?: AdmissionRecord } {
+    if (!this.canOperateProvince(user, input.provinceId)) {
+      return { success: false, message: 'Sem jurisdição provincial para admitir reclusos.' };
+    }
+
+    const normBi = isMeaningfulBi(input.biNumber) ? input.biNumber.trim().toUpperCase() : '';
+    const normMat = input.matricula.trim().toUpperCase();
+    const nowIso = new Date().toISOString();
+
+    const matchedById = input.existingInmateId
+      ? this.inmates.find((i) => i.inmateId === input.existingInmateId)
+      : undefined;
+    const duplicate =
+      matchedById ||
+      this.inmates.find(
+        (i) =>
+          (normBi && isMeaningfulBi(i.profile.biNumber) && i.profile.biNumber.trim().toUpperCase() === normBi) ||
+          (normMat && i.profile.matricula.trim().toUpperCase() === normMat)
+      );
+
+    if (duplicate) {
+      if (duplicate.currentStatus === 'EVADIDO' || duplicate.custodyState === 'EVADIDO') {
+        return {
+          success: false,
+          message: `Recluso ${duplicate.profile.fullName} (${duplicate.profile.matricula}) encontra-se EVADIDO. Utilize o fluxo de Recaptura.`
+        };
+      }
+      if (duplicate.currentStatus === 'FALECIDO' || duplicate.custodyState === 'FALECIDO') {
+        return {
+          success: false,
+          message: `FUR bloqueada por óbito registado (${duplicate.profile.matricula}).`
+        };
+      }
+      if (duplicate.currentStatus === 'ATIVO' || duplicate.currentStatus === 'TRANSFERIDO') {
+        return {
+          success: false,
+          message: `Conflito de Identidade Nacional: já existe uma FUR ativa para BI/Matrícula (${duplicate.profile.matricula}).`
+        };
+      }
+
+      if (!input.reentry) {
+        return {
+          success: false,
+          message: `Cidadão já possui FUR histórica (${duplicate.profile.matricula}) em estado ${duplicate.currentStatus}. Selecione a ficha na pesquisa e ative Reentrada na Mesma FUR.`
+        };
+      }
+
+      // Reentrada sobre a mesma FUR vitalícia (sem duplicar perfil, visitantes ou histórico)
+      const admissionId = `adm-${Date.now()}`;
+      duplicate.provinceId = input.provinceId;
+      duplicate.establishmentId = input.establishmentId || duplicate.establishmentId;
+      duplicate.currentStatus = 'ATIVO';
+      duplicate.custodyState = 'ATIVO_NA_UNIDADE';
+      duplicate.version = (duplicate.version || 1) + 1;
+      duplicate.updatedAt = nowIso;
+      duplicate.updatedBy = user.profile.fullName;
+      duplicate.admission = {
+        ...duplicate.admission,
+        admissionId,
+        admissionDate: nowIso.split('T')[0],
+        courtName: input.courtName.trim(),
+        processNumber: input.processNumber.trim(),
+        mandateNumber: `MAND-${Date.now().toString().slice(-4)}`,
+        custodyReason: input.crimeCategory.trim() || 'Novo Mandado / Reingresso',
+        intakeOfficer: user.profile.fullName
+      };
+      duplicate.legal = {
+        ...duplicate.legal,
+        legalStatus: 'PREVENTIVO',
+        crimeCategory: input.crimeCategory.trim()
+      };
+      duplicate.documents.unshift({
+        documentId: `doc-reent-${Date.now()}`,
+        title: `Mandado de Reingresso (${input.processNumber.trim()})`,
+        type: 'GUIA_CONDUCAO',
+        uploadDate: nowIso.split('T')[0],
+        fileSize: 'Digital (PNAP)'
+      });
+
+      const admission: AdmissionRecord = {
+        admissionId,
+        inmateId: duplicate.inmateId,
+        fullName: duplicate.profile.fullName,
+        matricula: duplicate.profile.matricula,
+        provinceId: duplicate.provinceId,
+        establishmentId: duplicate.establishmentId,
+        courtName: duplicate.admission.courtName,
+        crime: duplicate.legal.crimeCategory,
+        timestamp: nowIso,
+        registeredBy: user.profile.fullName
+      };
+
+      this.admissions.unshift(admission);
+      this.syncNationalIndexFromInmate(duplicate);
+      this.auditLogs.unshift({
+        eventId: `evt-reent-${Date.now()}`,
+        timestamp: nowIso,
+        userId: user.uid,
+        userName: user.profile.fullName,
+        userRole: user.assignments.role,
+        userScopeProvince: duplicate.provinceId,
+        action: 'INMATE_REENTRY_SAME_FUR',
+        targetResource: `pnap/inmates/${duplicate.inmateId}`,
+        details: `Reentrada na mesma FUR (${duplicate.profile.matricula}) sem duplicação de dados biográficos. Processo: ${admission.courtName}.`,
+        ipAddress: '10.0.0.1 (Terminal PNAP)',
+        jurisdictionStatus: 'AUTHORIZED'
+      });
+      this.notify();
+      return {
+        success: true,
+        message: `Reentrada registada sobre a mesma FUR (${duplicate.profile.matricula}) · v${duplicate.version}.`,
+        inmate: duplicate,
+        admission
+      };
+    }
+
+    const inmateId = `inm-${Date.now()}`;
+    const inmate: Inmate = {
+      inmateId,
+      provinceId: input.provinceId,
+      establishmentId: input.establishmentId || 'comarca-viana',
+      pavilionId: 'pav-1',
+      blockId: 'blk-1',
+      cellId: 'cel-1',
+      currentStatus: 'ATIVO',
+      custodyState: 'ATIVO_NA_UNIDADE',
+      version: 1,
+      profile: {
+        inmateId,
+        fullName: input.fullName.trim(),
+        matricula: input.matricula.trim(),
+        biNumber: input.biNumber.trim(),
+        dateOfBirth: '1990-01-01',
+        gender: input.gender,
+        provinceOfOrigin: PROVINCES_DATA[input.provinceId]?.name || input.provinceId,
+        fatherName: 'Não declarado',
+        motherName: 'Não declarada',
+        neighborhood: 'Em verificação',
+        photoUrl: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=300&fit=crop&crop=faces',
+        emergencyContact: { name: 'Contacto pendente', phone: '', relationship: 'Familiar' }
+      },
+      admission: {
+        admissionId: `adm-${Date.now()}`,
+        admissionDate: nowIso.split('T')[0],
+        courtName: input.courtName.trim(),
+        processNumber: input.processNumber.trim(),
+        mandateNumber: `MAND-${Date.now().toString().slice(-4)}`,
+        custodyReason: input.crimeCategory.trim() || 'Mandado de Condução / Prisão Preventiva',
+        initialPavilionId: 'pav-1',
+        intakeOfficer: user.profile.fullName
+      },
+      legal: {
+        legalStatus: 'PREVENTIVO',
+        crimeCategory: input.crimeCategory.trim(),
+        penalCodeArticle: 'Código Penal Angolano',
+        totalSentenceYears: 0,
+        totalSentenceMonths: 0,
+        timeServedMonths: 0,
+        remissionEarnedMonths: 0,
+        eligibleParoleDate: '',
+        endOfSentenceDate: ''
+      },
+      health: {
+        bloodType: 'N/D',
+        chronicDiseases: [],
+        allergies: [],
+        dailyMedication: [],
+        mentalHealthStatus: 'Aguardando triagem clínica inicial',
+        lastMedicalCheckup: nowIso.split('T')[0],
+        dietaryRestrictions: 'Comum'
+      },
+      rehabilitation: {
+        educationLevel: 'Em avaliação',
+        coursesEnrolled: [],
+        meritPoints: 50,
+        conductClassification: 'BOM',
+        riskLevel: 'MEDIO'
+      },
+      incidents: [],
+      disciplinary: { infractionsCount: 0, sanctionHistory: [] },
+      postInstitutional: { reintegrationPlanStatus: 'EM_ANALISE', familyShelterConfirmed: false, vocationalRecommendation: 'Avaliação inicial' },
+      documents: [],
+      visitors: [],
+      visits: [],
+      updatedAt: nowIso,
+      updatedBy: user.profile.fullName
+    };
+
+    const admission: AdmissionRecord = {
+      admissionId: `adm-${Date.now()}`,
+      inmateId,
+      fullName: inmate.profile.fullName,
+      matricula: inmate.profile.matricula,
+      provinceId: inmate.provinceId,
+      establishmentId: inmate.establishmentId,
+      courtName: inmate.admission.courtName,
+      crime: inmate.legal.crimeCategory,
+      timestamp: nowIso,
+      registeredBy: user.profile.fullName
+    };
+
+    this.inmates.unshift(inmate);
+    INMATES_LOCAL_DB.unshift(inmate);
+    this.admissions.unshift(admission);
+    this.syncNationalIndexFromInmate(inmate);
+    this.notify();
+    return {
+      success: true,
+      message: `FUR criada (${inmate.profile.matricula}) · Versão 1.`,
+      inmate,
+      admission
+    };
+  }
+
+  recaptureInmateOffline(
+    user: PnapUser,
+    inmateId: string,
+    documentNumber: string,
+    authorityOrEscort: string
+  ): { success: boolean; message: string; inmate?: Inmate } {
+    const inmate = this.inmates.find((i) => i.inmateId === inmateId);
+    if (!inmate) return { success: false, message: 'FUR não encontrada.' };
+    if (inmate.currentStatus !== 'EVADIDO' && inmate.custodyState !== 'EVADIDO') {
+      return { success: false, message: 'Apenas reclusos EVADIDOS podem ser recapturados.' };
+    }
+    const nowIso = new Date().toISOString();
+    inmate.currentStatus = 'ATIVO';
+    inmate.custodyState = 'ATIVO_NA_UNIDADE';
+    inmate.version = (inmate.version || 1) + 1;
+    inmate.updatedAt = nowIso;
+    inmate.updatedBy = user.profile.fullName;
+    this.syncNationalIndexFromInmate(inmate);
+    this.auditLogs.unshift({
+      eventId: `evt-rec-${Date.now()}`,
+      timestamp: nowIso,
+      userId: user.uid,
+      userName: user.profile.fullName,
+      userRole: user.assignments.role,
+      userScopeProvince: inmate.provinceId,
+      action: 'INMATE_RECAPTURED',
+      targetResource: `pnap/inmates/${inmateId}`,
+      details: `Recaptura registada sobre a mesma FUR (${inmate.profile.matricula}) · Auto ${documentNumber} (${authorityOrEscort}).`,
+      ipAddress: '10.0.0.1 (Terminal PNAP)',
+      jurisdictionStatus: 'AUTHORIZED'
+    });
+    this.notify();
+    return { success: true, message: `Recaptura concluída: ${inmate.profile.fullName} reativado na mesma matrícula.`, inmate };
+  }
+
+  receiveTransferOffline(user: PnapUser, transferId: string): { success: boolean; message: string } {
+    const trf = this.physicalTransfers.find((t) => t.transferId === transferId);
+    if (!trf) return { success: false, message: 'Guia de transferência não encontrada.' };
+    if (!this.canOperateProvince(user, trf.destinationProvinceId)) {
+      return { success: false, message: 'Apenas a unidade de destino ou Direção Geral pode confirmar receção.' };
+    }
+    trf.status = 'CONCLUIDO';
+    const inmate = this.inmates.find((i) => i.inmateId === trf.inmateId);
+    if (inmate) {
+      inmate.provinceId = trf.destinationProvinceId;
+      inmate.establishmentId = trf.destinationEstablishmentId;
+      inmate.currentStatus = 'ATIVO';
+      inmate.custodyState = 'ATIVO_NA_UNIDADE';
+      inmate.version = (inmate.version || 1) + 1;
+      inmate.updatedAt = new Date().toISOString();
+      inmate.updatedBy = user.profile.fullName;
+      this.syncNationalIndexFromInmate(inmate);
+    }
+    this.notify();
+    return { success: true, message: `Receção confirmada em ${trf.destinationEstablishmentId} (${trf.destinationProvinceId.toUpperCase()}).` };
+  }
+
+  // --- 8. VISITAS, VISITANTES & INCIDENTES INTEGRADOS DIRETAMENTE NA FUR (SEM DUPLICAÇÃO) ---
+  getVisitorsFromFursOffline(user: PnapUser): VisitorRecord[] {
+    const byId = new Map<string, VisitorRecord>();
+    this.inmates
+      .filter((i) => this.canOperateProvince(user, i.provinceId))
+      .forEach((inm) => {
+        (inm.visitors || []).forEach((v) => {
+          byId.set(v.visitorId, {
+            visitorId: v.visitorId,
+            fullName: v.fullName,
+            biNumber: v.biNumber,
+            phone: v.phone,
+            relationship: v.relationship,
+            inmateId: inm.inmateId,
+            inmateName: inm.profile.fullName,
+            provinceId: inm.provinceId,
+            establishmentId: inm.establishmentId,
+            lastVisitDate: v.lastVisitDate || '',
+            status: v.status
+          });
+        });
+      });
+    MOCK_VISITORS.forEach((mv) => {
+      if (this.canOperateProvince(user, mv.provinceId) && !byId.has(mv.visitorId)) {
+        byId.set(mv.visitorId, mv);
+      }
+    });
+    return Array.from(byId.values());
+  }
+
+  getVisitsFromFursOffline(user: PnapUser): VisitRecord[] {
+    const byId = new Map<string, VisitRecord>();
+    this.inmates
+      .filter((i) => this.canOperateProvince(user, i.provinceId))
+      .forEach((inm) => {
+        (inm.visits || []).forEach((vst) => {
+          byId.set(vst.visitId, {
+            visitId: vst.visitId,
+            visitorId: vst.visitorId,
+            visitorName: vst.visitorName,
+            inmateId: inm.inmateId,
+            inmateName: inm.profile.fullName,
+            provinceId: inm.provinceId,
+            establishmentId: inm.establishmentId,
+            date: vst.date,
+            timeSlot: vst.timeSlot,
+            inspectionPassed: vst.inspectionPassed,
+            dutyOfficer: vst.dutyOfficer
+          });
+        });
+      });
+    MOCK_VISITS.forEach((mv) => {
+      if ((!mv.provinceId || this.canOperateProvince(user, mv.provinceId)) && !byId.has(mv.visitId)) {
+        byId.set(mv.visitId, mv);
+      }
+    });
+    return Array.from(byId.values()).sort((a, b) => b.date.localeCompare(a.date));
+  }
+
+  registerVisitorOnFurOffline(
+    user: PnapUser,
+    inmateId: string,
+    payload: { fullName: string; biNumber: string; phone?: string; relationship?: string }
+  ): { success: boolean; message: string; visitor?: VisitorRecord; inmate?: Inmate } {
+    const inmate = this.inmates.find((i) => i.inmateId === inmateId);
+    if (!inmate) return { success: false, message: 'FUR do recluso não encontrada.' };
+    if (!this.canOperateProvince(user, inmate.provinceId)) {
+      return { success: false, message: 'Sem jurisdição provincial sobre esta FUR.' };
+    }
+    const custody = inmate.custodyState || inmate.currentStatus;
+    if (custody === 'LIBERTADO' || custody === 'FALECIDO') {
+      return { success: false, message: `Não é possível vincular visitante a recluso ${custody}.` };
+    }
+    const nowIso = new Date().toISOString();
+    const normBi = payload.biNumber.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const list = [...(inmate.visitors || [])];
+    const existingIdx = list.findIndex(
+      (v) => v.biNumber.trim().toUpperCase().replace(/[^A-Z0-9]/g, '') === normBi
+    );
+    let embedded: InmateVisitor;
+    let actionLabel = 'autorizado';
+    if (existingIdx >= 0) {
+      if (list[existingIdx].status === 'SUSPENSO') {
+        return {
+          success: false,
+          message: `Visitante ${list[existingIdx].fullName} já consta como SUSPENSO nesta FUR.`
+        };
+      }
+      embedded = {
+        ...list[existingIdx],
+        fullName: payload.fullName.trim(),
+        phone: (payload.phone || list[existingIdx].phone || '').trim(),
+        relationship: (payload.relationship || list[existingIdx].relationship || 'Familiar').trim()
+      };
+      list[existingIdx] = embedded;
+      actionLabel = 'atualizado';
+    } else {
+      embedded = {
+        visitorId: `vis-${Date.now()}`,
+        fullName: payload.fullName.trim(),
+        biNumber: payload.biNumber.trim(),
+        phone: (payload.phone || '').trim(),
+        relationship: (payload.relationship || 'Familiar').trim(),
+        status: 'AUTORIZADO',
+        registeredAt: nowIso,
+        registeredBy: user.profile.fullName
+      };
+      list.unshift(embedded);
+    }
+
+    inmate.visitors = list;
+    inmate.version = (inmate.version || 1) + 1;
+    inmate.updatedAt = nowIso;
+    inmate.updatedBy = user.profile.fullName;
+    this.syncNationalIndexFromInmate(inmate);
+
+    const record: VisitorRecord = {
+      visitorId: embedded.visitorId,
+      fullName: embedded.fullName,
+      biNumber: embedded.biNumber,
+      phone: embedded.phone,
+      relationship: embedded.relationship,
+      inmateId: inmate.inmateId,
+      inmateName: inmate.profile.fullName,
+      provinceId: inmate.provinceId,
+      establishmentId: inmate.establishmentId,
+      lastVisitDate: embedded.lastVisitDate || '',
+      status: embedded.status
+    };
+    this.notify();
+    return {
+      success: true,
+      message: `Visitante ${embedded.fullName} ${actionLabel} diretamente na FUR (${inmate.profile.matricula}).`,
+      visitor: record,
+      inmate
+    };
+  }
+
+  toggleVisitorStatusOnFurOffline(
+    user: PnapUser,
+    inmateId: string,
+    visitorId: string,
+    status: 'AUTORIZADO' | 'SUSPENSO',
+    reason?: string
+  ): { success: boolean; message: string; visitor?: VisitorRecord; inmate?: Inmate } {
+    const inmate = this.inmates.find((i) => i.inmateId === inmateId);
+    if (!inmate) return { success: false, message: 'FUR não encontrada.' };
+    if (!this.canOperateProvince(user, inmate.provinceId)) {
+      return { success: false, message: 'Sem jurisdição provincial.' };
+    }
+    const list = [...(inmate.visitors || [])];
+    const idx = list.findIndex((v) => v.visitorId === visitorId);
+    if (idx < 0) return { success: false, message: 'Visitante não encontrado na FUR.' };
+
+    const nowIso = new Date().toISOString();
+    list[idx] = {
+      ...list[idx],
+      status,
+      ...(status === 'SUSPENSO'
+        ? { suspendedReason: reason?.trim() || 'Suspensão administrativa' }
+        : { suspendedReason: undefined })
+    };
+    inmate.visitors = list;
+    inmate.version = (inmate.version || 1) + 1;
+    inmate.updatedAt = nowIso;
+    inmate.updatedBy = user.profile.fullName;
+    this.syncNationalIndexFromInmate(inmate);
+
+    const updated = list[idx];
+    this.notify();
+    return {
+      success: true,
+      message: `${updated.fullName} atualizado para ${status} na FUR.`,
+      visitor: {
+        visitorId: updated.visitorId,
+        fullName: updated.fullName,
+        biNumber: updated.biNumber,
+        phone: updated.phone,
+        relationship: updated.relationship,
+        inmateId: inmate.inmateId,
+        inmateName: inmate.profile.fullName,
+        provinceId: inmate.provinceId,
+        establishmentId: inmate.establishmentId,
+        lastVisitDate: updated.lastVisitDate || '',
+        status: updated.status
+      },
+      inmate
+    };
+  }
+
+  registerVisitCheckInOnFurOffline(
+    user: PnapUser,
+    inmateId: string,
+    payload: { visitorId: string; date?: string; timeSlot?: string; inspectionPassed: boolean; notes?: string }
+  ): { success: boolean; message: string; visit?: VisitRecord; inmate?: Inmate } {
+    const inmate = this.inmates.find((i) => i.inmateId === inmateId);
+    if (!inmate) return { success: false, message: 'FUR não encontrada.' };
+    if (!this.canOperateProvince(user, inmate.provinceId)) {
+      return { success: false, message: 'Sem jurisdição provincial.' };
+    }
+    const custody = inmate.custodyState || (inmate.currentStatus === 'ATIVO' ? 'ATIVO_NA_UNIDADE' : inmate.currentStatus);
+    if (custody !== 'ATIVO_NA_UNIDADE') {
+      return { success: false, message: `Visita bloqueada: custódia atual é ${custody}.` };
+    }
+    const visitDate = payload.date?.trim() || new Date().toISOString().split('T')[0];
+    if (
+      inmate.disciplinary?.visitsBlockedUntil &&
+      visitDate <= inmate.disciplinary.visitsBlockedUntil
+    ) {
+      return {
+        success: false,
+        message: `Visita bloqueada por sanção disciplinar até ${inmate.disciplinary.visitsBlockedUntil}.`
+      };
+    }
+    const list = [...(inmate.visitors || [])];
+    const visIdx = list.findIndex((v) => v.visitorId === payload.visitorId);
+    if (visIdx < 0) return { success: false, message: 'Visitante não autorizado nesta FUR.' };
+    const visitor = list[visIdx];
+    if (visitor.status !== 'AUTORIZADO') {
+      return {
+        success: false,
+        message: `Visitante ${visitor.fullName} está SUSPENSO${visitor.suspendedReason ? ` (${visitor.suspendedReason})` : ''}.`
+      };
+    }
+    if (!payload.inspectionPassed) {
+      return { success: false, message: 'Visita bloqueada: inspeção obrigatória de portaria não aprovada.' };
+    }
+
+    const nowIso = new Date().toISOString();
+    const embeddedVisit: InmateVisit = {
+      visitId: `vst-${Date.now()}`,
+      visitorId: visitor.visitorId,
+      visitorName: visitor.fullName,
+      visitorBi: visitor.biNumber,
+      date: visitDate,
+      timeSlot: payload.timeSlot?.trim() || '09:00 - 11:00',
+      inspectionPassed: true,
+      dutyOfficer: user.profile.fullName,
+      ...(payload.notes?.trim() ? { notes: payload.notes.trim() } : {})
+    };
+    list[visIdx] = { ...visitor, lastVisitDate: visitDate };
+    inmate.visitors = list;
+    inmate.visits = [embeddedVisit, ...(inmate.visits || [])];
+    inmate.version = (inmate.version || 1) + 1;
+    inmate.updatedAt = nowIso;
+    inmate.updatedBy = user.profile.fullName;
+
+    const visitRecord: VisitRecord = {
+      visitId: embeddedVisit.visitId,
+      visitorId: embeddedVisit.visitorId,
+      visitorName: embeddedVisit.visitorName,
+      inmateId: inmate.inmateId,
+      inmateName: inmate.profile.fullName,
+      provinceId: inmate.provinceId,
+      establishmentId: inmate.establishmentId,
+      date: embeddedVisit.date,
+      timeSlot: embeddedVisit.timeSlot,
+      inspectionPassed: true,
+      dutyOfficer: embeddedVisit.dutyOfficer
+    };
+    this.notify();
+    return {
+      success: true,
+      message: `Entrada registada diretamente na FUR de ${inmate.profile.fullName}.`,
+      visit: visitRecord,
+      inmate
+    };
+  }
+
+  registerIncidentOnFurOffline(
+    user: PnapUser,
+    inmateId: string,
+    payload: {
+      type: InmateIncident['type'];
+      severity: InmateIncident['severity'];
+      description: string;
+      actionsTaken: string;
+      date?: string;
+      sanctionMeasure?: string;
+      visitsBlockedUntil?: string;
+      meritPenaltyPoints?: number;
+      source?: 'INTERNO' | 'VISITA';
+      visitorId?: string;
+      visitorName?: string;
+      visitorBi?: string;
+      suspendVisitorId?: string;
+    }
+  ): { success: boolean; message: string; incident?: InmateIncident; inmate?: Inmate } {
+    const inmate = this.inmates.find((i) => i.inmateId === inmateId);
+    if (!inmate) return { success: false, message: 'FUR não encontrada.' };
+    if (!this.canOperateProvince(user, inmate.provinceId)) {
+      return { success: false, message: 'Sem jurisdição provincial.' };
+    }
+    const nowIso = new Date().toISOString();
+    const incidentDate = payload.date?.trim() || nowIso.split('T')[0];
+    const source: 'INTERNO' | 'VISITA' = payload.source === 'VISITA' ? 'VISITA' : 'INTERNO';
+    const incident: InmateIncident = {
+      incidentId: `inc-${Date.now()}`,
+      date: incidentDate,
+      type: payload.type,
+      severity: payload.severity,
+      description: payload.description.trim(),
+      actionsTaken: payload.actionsTaken.trim(),
+      reportedBy: user.profile.fullName,
+      source,
+      ...(payload.visitorId ? { visitorId: payload.visitorId } : {}),
+      ...(payload.visitorName ? { visitorName: payload.visitorName } : {}),
+      ...(payload.visitorBi ? { visitorBi: payload.visitorBi } : {})
+    };
+
+    inmate.incidents = [incident, ...(inmate.incidents || [])];
+    inmate.disciplinary = {
+      ...inmate.disciplinary,
+      infractionsCount: (inmate.disciplinary?.infractionsCount || 0) + 1,
+      lastInfractionDate: incidentDate,
+      ...(payload.sanctionMeasure?.trim()
+        ? {
+            activeSanction: payload.sanctionMeasure.trim(),
+            sanctionHistory: [
+              {
+                date: incidentDate,
+                description: incident.description,
+                measure: payload.sanctionMeasure.trim(),
+                signedBy: user.profile.fullName
+              },
+              ...(inmate.disciplinary?.sanctionHistory || [])
+            ]
+          }
+        : {}),
+      ...(payload.visitsBlockedUntil?.trim()
+        ? { visitsBlockedUntil: payload.visitsBlockedUntil.trim() }
+        : {})
+    };
+
+    if (payload.suspendVisitorId && inmate.visitors) {
+      inmate.visitors = inmate.visitors.map((v) =>
+        v.visitorId === payload.suspendVisitorId
+          ? {
+              ...v,
+              status: 'SUSPENSO',
+              suspendedReason:
+                payload.sanctionMeasure?.trim() || `Incidente em visita (${incident.type})`
+            }
+          : v
+      );
+    }
+
+    const penalty = Math.max(0, Number(payload.meritPenaltyPoints) || 0);
+    inmate.rehabilitation = {
+      ...inmate.rehabilitation,
+      meritPoints: Math.max(0, (inmate.rehabilitation?.meritPoints || 0) - penalty)
+    };
+    inmate.version = (inmate.version || 1) + 1;
+    inmate.updatedAt = nowIso;
+    inmate.updatedBy = user.profile.fullName;
+    this.syncNationalIndexFromInmate(inmate);
+
+    this.auditLogs.unshift({
+      eventId: `evt-inc-${Date.now()}`,
+      timestamp: nowIso,
+      userId: user.uid,
+      userName: user.profile.fullName,
+      userRole: user.assignments.role,
+      userScopeProvince: inmate.provinceId,
+      action: source === 'VISITA' ? 'VISITOR_INCIDENT_MIGRATED_TO_FUR' : 'INMATE_INCIDENT_REGISTERED',
+      targetResource: `pnap/inmates/${inmate.inmateId}`,
+      details: `Ocorrência [${source}] gravada diretamente na FUR de ${inmate.profile.fullName} (${incident.type}).`,
+      ipAddress: '10.0.0.1 (Terminal PNAP)',
+      jurisdictionStatus: 'AUTHORIZED'
+    });
+
+    this.notify();
+    return {
+      success: true,
+      message: `Ocorrência (${source}) migrada diretamente para a FUR de ${inmate.profile.fullName}.`,
+      incident,
+      inmate
     };
   }
 }

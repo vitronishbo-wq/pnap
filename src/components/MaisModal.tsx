@@ -1,20 +1,44 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { PNAP_SYSTEM_DATA } from '../data/mockPnapData';
+import type { PnapCatalog } from '../types/pnap';
 import { pnapStore } from '../services/pnapStore';
+import { fetchAuditLogsViaApi, fetchCatalogsViaApi } from '../services/apiClient';
 import { Settings, X, Building2, Lock, Sparkles } from 'lucide-react';
 
 interface MaisModalProps {
   onClose: () => void;
   currentUserRole: string;
+  apiActive?: boolean;
   onOpenProvisionamento?: () => void;
 }
 
 export const MaisModal: React.FC<MaisModalProps> = ({
   onClose,
   currentUserRole,
+  apiActive = false,
   onOpenProvisionamento
 }) => {
   const [activeTab, setActiveTab] = useState<'system' | 'provisioning' | 'audit' | 'jurisdiction'>('system');
+  const [, setStoreTick] = useState(0);
+  const [catalogs, setCatalogs] = useState<PnapCatalog[]>([]);
+
+  useEffect(() => {
+    return pnapStore.subscribe(() => setStoreTick((t) => t + 1));
+  }, []);
+
+  useEffect(() => {
+    if (!apiActive) return;
+    if (activeTab === 'audit') {
+      fetchAuditLogsViaApi()
+        .then((res) => pnapStore.syncLiveAuditLogs(res.logs))
+        .catch(() => {});
+    } else if (activeTab === 'system') {
+      fetchCatalogsViaApi()
+        .then((res) => setCatalogs(res.catalogs))
+        .catch(() => {});
+    }
+  }, [activeTab, apiActive]);
+
   const auditLogs = pnapStore.getAuditLogs();
   const isCentralAdmin = currentUserRole === 'CENTRAL_ADMIN';
 
@@ -36,7 +60,7 @@ export const MaisModal: React.FC<MaisModalProps> = ({
                     : 'bg-slate-800 text-slate-300'
                 }`}
               >
-                {isCentralAdmin ? 'Global' : 'Provincial'}
+                {isCentralAdmin ? 'Global' : currentUserRole}
               </span>
             </div>
           </div>
@@ -112,7 +136,7 @@ export const MaisModal: React.FC<MaisModalProps> = ({
                 </div>
 
                 <div className="bg-[#10233f] p-3 rounded-xl border border-blue-900/40">
-                  <span className="text-slate-400 block text-[10px]">Esquema</span>
+                  <span className="text-slate-400 block text-[10px]">Esquema FUR</span>
                   <div className="text-xs sm:text-sm font-bold text-white mt-0.5">
                     {PNAP_SYSTEM_DATA.schemaVersions.current}
                   </div>
@@ -126,6 +150,20 @@ export const MaisModal: React.FC<MaisModalProps> = ({
                   </div>
                 </div>
               </div>
+
+              {catalogs.length > 0 && (
+                <div className="bg-[#10233f] p-3 rounded-xl border border-blue-900/40 space-y-1.5">
+                  <div className="font-bold text-slate-300">
+                    Catálogos Dinâmicos Ativos ({catalogs.length})
+                  </div>
+                  {catalogs.map((cat) => (
+                    <div key={cat.catalogId} className="text-[11px] text-slate-300 flex justify-between">
+                      <span>{cat.category}</span>
+                      <span className="text-blue-300 font-mono">{cat.items.length} itens</span>
+                    </div>
+                  ))}
+                </div>
+              )}
 
               <div className="bg-[#10233f] p-3 rounded-xl border border-blue-700/50 flex items-center justify-between gap-3">
                 <div className="font-bold text-xs sm:text-sm text-white flex items-center gap-2">
@@ -222,17 +260,25 @@ export const MaisModal: React.FC<MaisModalProps> = ({
 
           {activeTab === 'jurisdiction' && (
             <div className="space-y-2 text-xs">
-              <div className="bg-[#10233f] p-3 rounded-xl border border-blue-900/40 flex items-center justify-between">
+              <div className="bg-[#10233f] p-3 rounded-xl border border-blue-900/40 flex items-center justify-between gap-2">
                 <strong className="text-amber-400">CENTRAL_ADMIN</strong>
-                <span className="text-slate-300">21 Províncias · Homologação</span>
+                <span className="text-slate-300 text-right">21 Províncias · Homologação · Catálogos</span>
               </div>
-              <div className="bg-[#10233f] p-3 rounded-xl border border-blue-900/40 flex items-center justify-between">
-                <strong className="text-blue-300">PROVINCIAL_COMMAND</strong>
-                <span className="text-slate-300">Jurisdição Local + Índice Nacional</span>
+              <div className="bg-[#10233f] p-3 rounded-xl border border-blue-900/40 flex items-center justify-between gap-2">
+                <strong className="text-blue-300">PROVINCIAL_COMMAND / DIRECTOR</strong>
+                <span className="text-slate-300 text-right">Dupla aprovação de soltura · Transferências</span>
               </div>
-              <div className="bg-[#10233f] p-3 rounded-xl border border-blue-900/40 flex items-center justify-between">
-                <strong className="text-purple-300">Transição vs Transferência</strong>
-                <span className="text-slate-300">Penal vs Física</span>
+              <div className="bg-[#10233f] p-3 rounded-xl border border-blue-900/40 flex items-center justify-between gap-2">
+                <strong className="text-emerald-300">PENAL_CONTROL / REHABILITATION</strong>
+                <span className="text-slate-300 text-right">Processos, Transições / Cela e Risco</span>
+              </div>
+              <div className="bg-[#10233f] p-3 rounded-xl border border-blue-900/40 flex items-center justify-between gap-2">
+                <strong className="text-rose-300">HEALTH_SPECIALIST</strong>
+                <span className="text-slate-300 text-right">Sigilo Clínico exclusivo da unidade</span>
+              </div>
+              <div className="bg-[#10233f] p-3 rounded-xl border border-blue-900/40 flex items-center justify-between gap-2">
+                <strong className="text-purple-300">GATE_SECURITY / AUDITOR_INSPECTOR</strong>
+                <span className="text-slate-300 text-right">Portaria e Escoltas / Auditoria Global</span>
               </div>
             </div>
           )}

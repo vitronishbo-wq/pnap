@@ -3,7 +3,7 @@ import { ProvinceId } from '../types/pnap';
 import { PROVINCES_DATA } from '../data/mockPnapData';
 import { ANGOLA_PROJECTED_PROVINCES, ProjectedProvince } from '../data/angolaVectorMapData';
 import { pnapStore } from '../services/pnapStore';
-import { MapPin, Lock, ChevronDown, CheckCircle2, Layers, Compass, ZoomIn, ZoomOut, RotateCcw } from 'lucide-react';
+import { MapPin, Lock, ChevronDown, CheckCircle2, ZoomIn, ZoomOut, RotateCcw, X } from 'lucide-react';
 
 interface AngolaMapProps {
   selectedProvinceId: ProvinceId;
@@ -22,25 +22,36 @@ export const AngolaMap: React.FC<AngolaMapProps> = ({
   const [showSelectorDropdown, setShowSelectorDropdown] = useState(false);
   const [zoomLevel, setZoomLevel] = useState<number>(1);
   const [showLabels, setShowLabels] = useState<boolean>(true);
+  const [jurisdictionNotice, setJurisdictionNotice] = useState<string | null>(null);
   const [, setStoreVersion] = useState(0);
 
   useEffect(() => {
     return pnapStore.subscribe(() => setStoreVersion((v) => v + 1));
   }, []);
 
-  // Regra de segurança: Acesso irrestrito ao ADMIN CENTRAL, restante restrito ao comando local
+  const hasGlobalScope =
+    userRole === 'CENTRAL_ADMIN' ||
+    (userRole === 'AUDITOR_INSPECTOR' && userAssignedProvince === 'all');
+
+  // Regra de segurança: Acesso irrestrito ao ADMIN CENTRAL / Auditor Nacional, restante restrito ao comando local
   const isProvinceAllowed = (provId: string) => {
-    if (userRole === 'CENTRAL_ADMIN') return true;
+    if (hasGlobalScope) return true;
     return provId === userAssignedProvince;
+  };
+
+  const showBlockedProvinceNotice = (provName: string) => {
+    const assignedName = PROVINCES_DATA[userAssignedProvince]?.name || userAssignedProvince;
+    setJurisdictionNotice(
+      `Jurisdição restrita a ${assignedName}: acesso direto a ${provName} negado. Utilize "Consultar" para pesquisa nacional federada.`
+    );
   };
 
   const handleProvinceClick = (prov: ProjectedProvince) => {
     if (!isProvinceAllowed(prov.provinceId)) {
-      alert(
-        `[ISOLAMENTO DE JURISDIÇÃO PNAP]\n\nAcesso direto negado aos ficheiros de ${prov.name}.\nO seu utilizador está credenciado exclusivamente para o Comando de ${PROVINCES_DATA[userAssignedProvince]?.name || 'Luanda'}.\n\nPara buscas transversais, utilize a aba 'Consultar' (Índice Nacional de Reclusos federado).`
-      );
+      showBlockedProvinceNotice(prov.name);
       return;
     }
+    setJurisdictionNotice(null);
     onSelectProvince(prov.provinceId);
   };
 
@@ -74,6 +85,24 @@ export const AngolaMap: React.FC<AngolaMapProps> = ({
           </span>
         </div>
       </div>
+
+      {/* Aviso inline de isolamento de jurisdição (sem window.alert) */}
+      {jurisdictionNotice && (
+        <div className="mb-1.5 px-2.5 py-1.5 rounded-lg bg-amber-950/85 border border-amber-500/60 text-amber-200 text-[11px] flex items-center justify-between gap-2 shrink-0">
+          <span className="flex items-center gap-1.5 min-w-0 truncate">
+            <Lock className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+            <span className="truncate">{jurisdictionNotice}</span>
+          </span>
+          <button
+            type="button"
+            onClick={() => setJurisdictionNotice(null)}
+            aria-label="Fechar aviso"
+            className="text-amber-300 hover:text-white shrink-0 cursor-pointer"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
 
       {/* Container Central do Mapa Vetorial (Sem fotos ou dados redundantes) */}
       <div className="relative flex-1 min-h-0 bg-[#cde4f0] rounded-xl overflow-hidden shadow-inner flex items-center justify-center border border-blue-950/20">
@@ -173,7 +202,7 @@ export const AngolaMap: React.FC<AngolaMapProps> = ({
                   fill = '#2563eb'; // Azul intenso para a província ativa
                 } else if (isHovered) {
                   fill = '#60a5fa'; // Azul claro no hover
-                } else if (!allowed && userRole !== 'CENTRAL_ADMIN') {
+                } else if (!allowed && !hasGlobalScope) {
                   fill = '#cbd5e1'; // Tom de isolamento jurisdicional
                 }
 
@@ -194,7 +223,7 @@ export const AngolaMap: React.FC<AngolaMapProps> = ({
                       strokeLinecap="round"
                       filter={isSelected ? 'url(#glow-selected)' : undefined}
                       className="transition-colors duration-150"
-                      opacity={!allowed && userRole !== 'CENTRAL_ADMIN' ? 0.65 : 1}
+                      opacity={!allowed && !hasGlobalScope ? 0.65 : 1}
                     />
 
                     {/* Nomes oficiais e siglas posicionados exatamente nos centróides calculados */}
@@ -279,7 +308,7 @@ export const AngolaMap: React.FC<AngolaMapProps> = ({
                 {!isProvinceAllowed(hoveredProvince.provinceId) && (
                   <div className="text-[10px] text-amber-300 flex items-center gap-1 mt-2 pt-1 border-t border-slate-800 font-medium">
                     <Lock className="w-3 h-3 text-amber-400 shrink-0" />
-                    Jurisdição restrita a Luanda
+                    Jurisdição restrita a {PROVINCES_DATA[userAssignedProvince]?.name || userAssignedProvince}
                   </div>
                 )}
               </div>
@@ -307,7 +336,7 @@ export const AngolaMap: React.FC<AngolaMapProps> = ({
                 Divisão Territorial RDPA 2024 (21 Províncias)
               </span>
               <span className="text-[10px] text-blue-400">
-                {userRole === 'CENTRAL_ADMIN' ? 'Acesso Global' : 'Filtro de Comando'}
+                {hasGlobalScope ? 'Acesso Global' : 'Filtro de Comando'}
               </span>
             </div>
             
@@ -322,11 +351,10 @@ export const AngolaMap: React.FC<AngolaMapProps> = ({
                     type="button"
                     onClick={() => {
                       if (!isAllowed) {
-                        alert(
-                          `[ISOLAMENTO DE COMPETÊNCIA]\nO seu utilizador está lotado no Comando Provincial de Luanda.\nNão tem permissão para aceder aos registos internos de ${prov.name}.\n\nPara buscas de reclusos em ${prov.name}, utilize a pesquisa federada em 'Consultar'.`
-                        );
+                        showBlockedProvinceNotice(prov.name);
                         return;
                       }
+                      setJurisdictionNotice(null);
                       onSelectProvince(prov.provinceId);
                       setShowSelectorDropdown(false);
                     }}

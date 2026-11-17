@@ -29,7 +29,7 @@
     },
     "PnapUser": {
       "title": "PnapUser",
-      "description": "Perfil operacional e matriz RBAC oficial do utilizador PNAP.",
+      "description": "Perfil operacional e matriz RBAC oficial do utilizador PNAP (9 perfis institucionais).",
       "type": "object",
       "properties": {
         "uid": {
@@ -44,7 +44,7 @@
         },
         "assignments": {
           "type": "object",
-          "description": "Atribuição de cargo, província e estabelecimento."
+          "description": "Atribuição de cargo (UserRole), província e estabelecimento."
         }
       },
       "required": ["uid", "profile", "assignments"]
@@ -135,9 +135,61 @@
       },
       "required": ["establishmentId", "provinceId", "name", "totalCapacity", "activeInmatesCount", "provisioningStatus"]
     },
+    "IdentityLock": {
+      "title": "IdentityLock",
+      "description": "Bloqueio de identidade única nacional para evitar duplicação de matrícula ou BI.",
+      "type": "object",
+      "properties": {
+        "lockKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "inmateId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "matricula": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "normalizedBiNumber": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "fullNameNormalized": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "activeCustodyState": {
+          "type": "string",
+          "enum": [
+            "PRE_ADMISSAO",
+            "ATIVO_NA_UNIDADE",
+            "EM_DILIGENCIA_EXTERNA",
+            "HOSPITALIZADO_EXTERNO",
+            "EM_TRANSITO_TRANSFERENCIA",
+            "LIBERTADO",
+            "EVADIDO",
+            "FALECIDO"
+          ]
+        },
+        "lastUpdated": {
+          "type": "string",
+          "maxLength": 64
+        }
+      },
+      "required": ["lockKey", "inmateId", "matricula", "normalizedBiNumber", "activeCustodyState", "lastUpdated"]
+    },
     "Inmate": {
       "title": "Inmate",
-      "description": "Ficha Única do recluso na província e unidade prisional de tutela.",
+      "description": "Ficha Única do Recluso (FUR) com separação ortogonal custódia/jurídico e versionamento otimista.",
       "type": "object",
       "properties": {
         "inmateId": {
@@ -154,14 +206,248 @@
         "establishmentId": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 128
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
         },
         "currentStatus": {
           "type": "string",
           "enum": ["ATIVO", "TRANSFERIDO", "LIBERTADO", "EVADIDO", "FALECIDO"]
+        },
+        "custodyState": {
+          "type": "string",
+          "enum": [
+            "PRE_ADMISSAO",
+            "ATIVO_NA_UNIDADE",
+            "EM_DILIGENCIA_EXTERNA",
+            "HOSPITALIZADO_EXTERNO",
+            "EM_TRANSITO_TRANSFERENCIA",
+            "LIBERTADO",
+            "EVADIDO",
+            "FALECIDO"
+          ]
+        },
+        "consolidatedLegalStatus": {
+          "type": "string",
+          "enum": ["PREVENTIVO", "CONDENADO", "RECORRENTE", "TRANSITO_EM_JULGADO", "EXTINTO"]
+        },
+        "activeProcessesCount": {
+          "type": "integer"
+        },
+        "version": {
+          "type": "integer"
+        },
+        "identityLockKey": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "healthAlerts": {
+          "type": "object",
+          "description": "Projeção não-clínica operacional (riscos, alergias e dieta sem diagnósticos)."
+        },
+        "visitors": {
+          "type": "array",
+          "maxItems": 100,
+          "description": "Visitantes autorizados ou suspensos armazenados diretamente na FUR."
+        },
+        "visits": {
+          "type": "array",
+          "maxItems": 200,
+          "description": "Histórico de entradas de visitantes na portaria armazenado diretamente na FUR."
         }
       },
       "required": ["inmateId", "provinceId", "establishmentId", "currentStatus"]
+    },
+    "JudicialProcess": {
+      "title": "JudicialProcess",
+      "description": "Processo judicial individual associado à FUR (suporta N processos simultâneos).",
+      "type": "object",
+      "properties": {
+        "processId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "inmateId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "provinceId": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40
+        },
+        "establishmentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "processNumber": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "courtName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "legalStatus": {
+          "type": "string",
+          "enum": ["PREVENTIVO", "CONDENADO", "RECORRENTE", "TRANSITO_EM_JULGADO", "EXTINTO"]
+        },
+        "isActive": {
+          "type": "boolean"
+        },
+        "updatedAt": {
+          "type": "string",
+          "maxLength": 64
+        }
+      },
+      "required": ["processId", "inmateId", "provinceId", "establishmentId", "processNumber", "legalStatus", "isActive"]
+    },
+    "HealthRecord": {
+      "title": "HealthRecord",
+      "description": "Registo clínico isolado (acesso estrito ao perfil HEALTH_SPECIALIST).",
+      "type": "object",
+      "properties": {
+        "recordId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "inmateId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "provinceId": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40
+        },
+        "establishmentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "clinicalDiagnosis": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "triageOutcome": {
+          "type": "string",
+          "enum": ["APTO_COMUM", "ISOLAMENTO_SANITARIO", "ENFERMARIA", "HOSPITAL_EXTERNO"]
+        },
+        "recordedByUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "recordedAt": {
+          "type": "string",
+          "maxLength": 64
+        }
+      },
+      "required": ["recordId", "inmateId", "provinceId", "establishmentId", "clinicalDiagnosis", "triageOutcome", "recordedByUid", "recordedAt"]
+    },
+    "MovementRecord": {
+      "title": "MovementRecord",
+      "description": "Registo imutável de movimentação física, transferência em duas etapas e recaptura.",
+      "type": "object",
+      "properties": {
+        "movementId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "inmateId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "provinceId": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40
+        },
+        "establishmentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "SAIDA_DILIGENCIA",
+            "RETORNO_DILIGENCIA",
+            "HOSPITALIZACAO_EXTERNA",
+            "RETORNO_HOSPITAL",
+            "TRANSFERENCIA_DESPACHO",
+            "TRANSFERENCIA_RECEPCAO",
+            "RECAPTURA",
+            "EVASAO",
+            "OBITO",
+            "SOLTURA_DEFINITIVA"
+          ]
+        },
+        "documentNumber": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "authorityOrEscort": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "timestamp": {
+          "type": "string",
+          "maxLength": 64
+        }
+      },
+      "required": ["movementId", "inmateId", "provinceId", "establishmentId", "type", "documentNumber", "timestamp"]
+    },
+    "PnapCatalog": {
+      "title": "PnapCatalog",
+      "description": "Catálogos dinâmicos configuráveis pela Direcção Geral Central.",
+      "type": "object",
+      "properties": {
+        "catalogId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "category": {
+          "type": "string",
+          "enum": ["CRIMES", "INCIDENTS", "EXIT_REASONS", "ESCORT_PROTOCOLS", "REHAB_PROGRAMS"]
+        },
+        "items": {
+          "type": "array"
+        },
+        "updatedAt": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "updatedBy": {
+          "type": "string",
+          "maxLength": 128
+        }
+      },
+      "required": ["catalogId", "category", "items", "updatedAt"]
     },
     "NationalInmateIndexItem": {
       "title": "NationalInmateIndexItem",
@@ -197,6 +483,31 @@
         "legalStatus": {
           "type": "string",
           "enum": ["PREVENTIVO", "CONDENADO", "RECORRENTE", "TRANSITO_EM_JULGADO"]
+        },
+        "custodyState": {
+          "type": "string",
+          "enum": [
+            "PRE_ADMISSAO",
+            "ATIVO_NA_UNIDADE",
+            "EM_DILIGENCIA_EXTERNA",
+            "HOSPITALIZADO_EXTERNO",
+            "EM_TRANSITO_TRANSFERENCIA",
+            "LIBERTADO",
+            "EVADIDO",
+            "FALECIDO"
+          ]
+        },
+        "processNumber": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "visitorKeywords": {
+          "type": "string",
+          "maxLength": 600
+        },
+        "searchText": {
+          "type": "string",
+          "maxLength": 1500
         }
       },
       "required": ["inmateId", "matricula", "fullName", "provinceId", "establishmentId", "legalStatus"]
@@ -315,7 +626,7 @@
     },
     "TransferRecord": {
       "title": "TransferRecord",
-      "description": "Guia de transferência física interprovincial ou interunidades.",
+      "description": "Guia de transferência física interprovincial ou interunidades em 2 etapas.",
       "type": "object",
       "properties": {
         "transferId": {
@@ -342,13 +653,17 @@
         "status": {
           "type": "string",
           "enum": ["PENDENTE", "AUTORIZADO_CENTRAL", "EM_TRANSITO", "CONCLUIDO", "REJEITADO"]
+        },
+        "stage": {
+          "type": "string",
+          "enum": ["DISPATCHED", "RECEIVED", "CANCELLED"]
         }
       },
       "required": ["transferId", "inmateId", "originProvinceId", "destinationProvinceId", "status"]
     },
     "AuditLogEvent": {
       "title": "AuditLogEvent",
-      "description": "Evento imutável de auditoria operacional e segurança RBAC do PNAP.",
+      "description": "Evento imutável de auditoria operacional e segurança RBAC do PNAP (exclusivo Admin SDK).",
       "type": "object",
       "properties": {
         "eventId": {
@@ -368,7 +683,17 @@
         },
         "userRole": {
           "type": "string",
-          "enum": ["CENTRAL_ADMIN", "PROVINCIAL_COMMAND", "ESTABLISHMENT_DIRECTOR", "OPERATIONAL_OFFICER"]
+          "enum": [
+            "CENTRAL_ADMIN",
+            "PROVINCIAL_COMMAND",
+            "ESTABLISHMENT_DIRECTOR",
+            "OPERATIONAL_OFFICER",
+            "PENAL_CONTROL",
+            "HEALTH_SPECIALIST",
+            "REHABILITATION",
+            "GATE_SECURITY",
+            "AUDITOR_INSPECTOR"
+          ]
         },
         "userScopeProvince": {
           "type": "string",
@@ -386,6 +711,103 @@
         }
       },
       "required": ["eventId", "timestamp", "userId", "userRole", "userScopeProvince", "action", "jurisdictionStatus"]
+    },
+    "VisitorRecord": {
+      "title": "VisitorRecord",
+      "description": "Registo de visitante autorizado ou suspenso vinculado a um recluso e estabelecimento.",
+      "type": "object",
+      "properties": {
+        "visitorId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "fullName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "biNumber": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "phone": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "relationship": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "inmateId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "provinceId": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40
+        },
+        "establishmentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["AUTORIZADO", "SUSPENSO"]
+        }
+      },
+      "required": ["visitorId", "fullName", "biNumber", "inmateId", "provinceId", "establishmentId", "status"]
+    },
+    "VisitRecord": {
+      "title": "VisitRecord",
+      "description": "Registo imutável de entrada de visitante validado contra sanções e custódia ativa.",
+      "type": "object",
+      "properties": {
+        "visitId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "visitorId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "inmateId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "provinceId": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40
+        },
+        "establishmentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "date": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "inspectionPassed": {
+          "type": "boolean"
+        }
+      },
+      "required": ["visitId", "visitorId", "inmateId", "provinceId", "establishmentId", "date", "inspectionPassed"]
     }
   },
   "firestore": {
@@ -405,13 +827,33 @@
       "schema": { "$ref": "#/entities/EstablishmentProfile" },
       "description": "Estabelecimentos prisionais e estrutura de pavilhões/blocos/celas."
     },
+    "/pnap_identity_locks/{lockKey}": {
+      "schema": { "$ref": "#/entities/IdentityLock" },
+      "description": "Índice de unicidade nacional (BI / Matrícula) para bloqueio de duplicação."
+    },
     "/pnap_inmates/{inmateId}": {
       "schema": { "$ref": "#/entities/Inmate" },
-      "description": "Fichas únicas de reclusos sob tutela provincial."
+      "description": "Fichas únicas de reclusos (FUR) sob tutela provincial e controlo de versão."
+    },
+    "/pnap_inmates/{inmateId}/judicial_processes/{processId}": {
+      "schema": { "$ref": "#/entities/JudicialProcess" },
+      "description": "Processos judiciais individuais vinculados à FUR."
+    },
+    "/pnap_inmates/{inmateId}/health_records/{recordId}": {
+      "schema": { "$ref": "#/entities/HealthRecord" },
+      "description": "Prontuários clínicos isolados acessíveis exclusivamente a HEALTH_SPECIALIST."
     },
     "/pnap_national_inmate_index/{inmateId}": {
       "schema": { "$ref": "#/entities/NationalInmateIndexItem" },
       "description": "Índice nacional federado para localização interprovincial."
+    },
+    "/pnap_movements/{movementId}": {
+      "schema": { "$ref": "#/entities/MovementRecord" },
+      "description": "Histórico imutável de diligências, transferências em 2 etapas e recapturas."
+    },
+    "/pnap_catalogs/{catalogId}": {
+      "schema": { "$ref": "#/entities/PnapCatalog" },
+      "description": "Catálogos dinâmicos configuráveis (crimes, incidentes, motivos, programas)."
     },
     "/pnap_admissions/{admissionId}": {
       "schema": { "$ref": "#/entities/AdmissionRecord" },
@@ -427,11 +869,19 @@
     },
     "/pnap_transfers/{transferId}": {
       "schema": { "$ref": "#/entities/TransferRecord" },
-      "description": "Guias de transferência física interprovincial."
+      "description": "Guias de transferência física interprovincial em duas etapas."
+    },
+    "/pnap_visitors/{visitorId}": {
+      "schema": { "$ref": "#/entities/VisitorRecord" },
+      "description": "Visitantes autorizados ou suspensos por recluso e estabelecimento."
+    },
+    "/pnap_visits/{visitId}": {
+      "schema": { "$ref": "#/entities/VisitRecord" },
+      "description": "Histórico imutável de visitas realizadas na portaria."
     },
     "/pnap_audit_logs/{eventId}": {
       "schema": { "$ref": "#/entities/AuditLogEvent" },
-      "description": "Trilha imutável de auditoria RBAC e operações PNAP."
+      "description": "Trilha imutável de auditoria RBAC escrita exclusivamente pelo Backend Admin SDK."
     }
   }
 }
